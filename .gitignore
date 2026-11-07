@@ -1,0 +1,4 @@
+/build/
+/helper/.build/
+/helper/.swiftpm/
+.DS_Store
