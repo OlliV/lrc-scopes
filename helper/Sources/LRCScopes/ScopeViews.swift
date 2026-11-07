@@ -15,6 +15,8 @@ enum ScopePalette {
 /// Common drawing for both scopes: dark background, optional centred message.
 class ScopeBaseView: NSView {
     var message: String? { didSet { needsDisplay = true } }
+    /// Short tag drawn in the top-right corner, e.g. "REGION" while a region is active.
+    var badge: String? { didSet { if badge != oldValue { needsDisplay = true } } }
 
     override var isOpaque: Bool { true }
     override var isFlipped: Bool { false }
@@ -38,6 +40,19 @@ class ScopeBaseView: NSView {
                                                       options: [.usesLineFragmentOrigin], attributes: attrs).size
         let r = NSRect(x: rect.minX + 10, y: rect.midY - size.height / 2, width: rect.width - 20, height: size.height)
         (message as NSString).draw(with: r, options: [.usesLineFragmentOrigin], attributes: attrs)
+    }
+
+    func drawBadge(in rect: NSRect) {
+        guard let badge else { return }
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 9, weight: .semibold), .foregroundColor: NSColor.black,
+        ]
+        let size = (badge as NSString).size(withAttributes: attrs)
+        let box = NSRect(x: rect.maxX - size.width - 12, y: rect.maxY - size.height - 8,
+                         width: size.width + 8, height: size.height + 2)
+        NSColor(srgbRed: 1, green: 0.8, blue: 0.25, alpha: 0.9).setFill()
+        NSBezierPath(roundedRect: box, xRadius: 3, yRadius: 3).fill()
+        (badge as NSString).draw(at: NSPoint(x: box.minX + 4, y: box.minY + 1), withAttributes: attrs)
     }
 
     func drawLabel(_ text: String, at point: NSPoint, alignment: NSTextAlignment, color: NSColor = ScopePalette.label) {
@@ -106,6 +121,7 @@ final class WaveformView: ScopeBaseView {
         ScopePalette.graticule.setStroke()
         path.stroke()
 
+        drawBadge(in: plot)
         drawMessage(in: plot)
     }
 }
@@ -199,6 +215,129 @@ final class VectorscopeView: ScopeBaseView {
         if zoom > 1.01 {
             drawLabel(String(format: "%.0f×", zoom), at: NSPoint(x: plot.maxX - 4, y: plot.maxY - 6), alignment: .right)
         }
+        drawBadge(in: bounds)
         drawMessage(in: plot)
+    }
+}
+
+/// Thumbnail of the photo on which the user drags out the region the scopes measure.
+///
+/// Drag to select. Click on the image outside the selection, double-click, or
+/// right-click › Measure Whole Image to go back to the whole image.
+/// Updates are reported live while dragging; the processor drops stale work.
+final class NavigatorView: ScopeBaseView {
+    var image: CGImage? { didSet { needsDisplay = true } }
+    var region: ScopeRegion? { didSet { if region != oldValue { needsDisplay = true } } }
+    var onRegionChanged: ((ScopeRegion?) -> Void)?
+
+    private var dragStart: (x: Double, y: Double)?
+    /// True once the current gesture has produced a region (i.e. it is a drag, not a click).
+    private var gestureSelected = false
+    private let inset: CGFloat = 8
+
+    override init(frame frameRect: NSRect) {
+        super.init(frame: frameRect)
+        let menu = NSMenu()
+        menu.addItem(withTitle: "Measure Whole Image", action: #selector(resetRegion(_:)), keyEquivalent: "").target = self
+        self.menu = menu
+        toolTip = "Drag to choose the area the scopes measure. Click outside the selection to measure the whole image."
+    }
+
+    required init?(coder: NSCoder) { fatalError("init(coder:) is not supported") }
+
+    /// The panel never becomes key; react to the very first click.
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+
+    /// Where the image is drawn: aspect-fit inside the view.
+    var imageRect: NSRect {
+        let area = bounds.insetBy(dx: inset, dy: inset)
+        guard let image, image.width > 0, image.height > 0, area.width > 0, area.height > 0 else { return area }
+        let scale = min(area.width / CGFloat(image.width), area.height / CGFloat(image.height))
+        let w = CGFloat(image.width) * scale, h = CGFloat(image.height) * scale
+        return NSRect(x: area.midX - w / 2, y: area.midY - h / 2, width: w, height: h).integral
+    }
+
+    /// View point -> normalised image coordinates (top-left origin), unclamped.
+    func normalizedPoint(_ p: NSPoint) -> (x: Double, y: Double) {
+        let r = imageRect
+        guard r.width > 0, r.height > 0 else { return (0, 0) }
+        return (Double((p.x - r.minX) / r.width), Double((r.maxY - p.y) / r.height))
+    }
+
+    /// Normalised region -> view rectangle.
+    func viewRect(for region: ScopeRegion) -> NSRect {
+        let r = imageRect
+        return NSRect(x: r.minX + CGFloat(region.x) * r.width,
+                      y: r.maxY - CGFloat(region.y + region.height) * r.height,
+                      width: CGFloat(region.width) * r.width,
+                      height: CGFloat(region.height) * r.height)
+    }
+
+    override func mouseDown(with event: NSEvent) {
+        guard image != nil else { return }
+        if event.clickCount == 2 {
+            dragStart = nil
+            setRegion(nil)
+            return
+        }
+        dragStart = normalizedPoint(convert(event.locationInWindow, from: nil))
+        gestureSelected = false
+    }
+
+    override func mouseDragged(with event: NSEvent) {
+        guard let start = dragStart else { return }
+        let current = normalizedPoint(convert(event.locationInWindow, from: nil))
+        // A drag that is still too small keeps the previous region on screen.
+        if let r = ScopeRegion.spanning(start, current) {
+            gestureSelected = true
+            setRegion(r)
+        }
+    }
+
+    override func mouseUp(with event: NSEvent) {
+        defer { dragStart = nil; gestureSelected = false }
+        guard dragStart != nil, !gestureSelected, let region else { return }
+        // A click (no drag) on the image but outside the selection clears it. Clicks
+        // inside the selection, or in the margin around the image, change nothing.
+        let p = convert(event.locationInWindow, from: nil)
+        if imageRect.contains(p) && !viewRect(for: region).contains(p) {
+            setRegion(nil)
+        }
+    }
+
+    @objc func resetRegion(_ sender: Any?) { setRegion(nil) }
+
+    private func setRegion(_ r: ScopeRegion?) {
+        guard r != region else { return }
+        region = r
+        onRegionChanged?(r)
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        ScopePalette.background.setFill()
+        bounds.fill()
+        guard let image, let ctx = NSGraphicsContext.current?.cgContext else {
+            drawMessage(in: bounds)
+            return
+        }
+        let r = imageRect
+        ctx.interpolationQuality = .high
+        ctx.draw(image, in: r)
+
+        if let region {
+            let sel = viewRect(for: region)
+            // Dim everything outside the selection.
+            let shade = NSBezierPath(rect: r)
+            shade.appendRect(sel)
+            shade.windingRule = .evenOdd
+            NSColor(white: 0, alpha: 0.6).setFill()
+            shade.fill()
+            let outline = NSBezierPath(rect: sel.insetBy(dx: 0.5, dy: 0.5))
+            outline.lineWidth = 1
+            NSColor.white.setStroke()
+            outline.stroke()
+        }
+        NSColor(white: 1, alpha: 0.2).setStroke()
+        NSBezierPath(rect: r.insetBy(dx: -0.5, dy: -0.5)).stroke()
     }
 }

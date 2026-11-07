@@ -46,9 +46,13 @@ Lightroom Classic                               LRC Scopes.app (bundled in the p
 
 ### Accuracy notes
 
-* The scopes analyse Lightroom's preview rendering (8-bit JPEG, by default ≥1024 px on
-  the long edge), not the full-resolution raw pipeline. Levels and hues are faithful;
-  single-pixel detail and banding below 8-bit are not.
+* The scopes analyse Lightroom's preview rendering (8-bit sRGB JPEG), not the
+  full-resolution raw pipeline. Levels and hues are faithful; single-pixel detail is
+  not. The plug-in asks for 1024 px, but Lightroom may return a smaller preview than
+  requested (≈770 px has been observed), despite the SDK documenting sizes as minimums.
+* 8-bit samples are spread over their ±½-step quantisation interval with a fixed,
+  repeatable dither. Without it, a 1024-level waveform of 8-bit data shows a comb of
+  empty levels. No sample moves by more than one source step.
 * Output is display-referred sRGB. Values outside sRGB (e.g. from a wide-gamut source)
   are clipped, just like an sRGB export.
 * While dragging a slider, Lightroom renders previews asynchronously, so the scopes can
@@ -79,6 +83,12 @@ SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" scripts/build.sh
   launches. Closing the panel also hides the scopes until *Show Scopes* is chosen again.
 * To bind a key: System Settings › Keyboard › Keyboard Shortcuts › App Shortcuts, add
   Adobe Lightroom Classic with the menu title `Show Scopes`.
+* **Region:** press *Region* to show a thumbnail of the photo, then drag on it to
+  measure only that area (the scopes show a REGION badge). Click on the image outside
+  the selection (or double-click, or right-click › *Measure Whole Image*) to go back.
+  Clicks inside the selection or in the margin around the image change nothing. The region resets when you move
+  to another photo and when you hide the thumbnail. Lightroom's own zoom can't be
+  followed: the SDK can change the zoom but cannot read it or the visible area.
 * Plug-in Manager options: analysis resolution, debug logging.
 * Logs: `~/Library/Logs/Adobe/Lightroom/LrClassicLogs/LRCScopes.log` (plug-in) and
   `log stream --predicate 'subsystem == "com.lrcscopes.helper"'` (helper).

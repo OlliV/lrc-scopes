@@ -20,5 +20,10 @@ let package = Package(
             name: "ScopesCoreTests",
             dependencies: ["ScopesCore"]
         ),
+        // Drives the real panel, views and frame processor in-process.
+        .testTarget(
+            name: "LRCScopesTests",
+            dependencies: ["LRCScopes", "ScopesCore"]
+        ),
     ]
 )

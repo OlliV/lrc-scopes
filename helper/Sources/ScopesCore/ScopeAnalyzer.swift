@@ -58,6 +58,14 @@ public struct ScopeAnalyzerConfiguration: Equatable {
     /// every 100% target and its label inside the graticule.
     public static let defaultChromaAtEdge: Float = 0.68
     public var vectorscopeChromaAtEdge: Float = ScopeAnalyzerConfiguration.defaultChromaAtEdge
+    /// Quantisation step of the source (1/255 for 8-bit JPEG previews), or 0 for none.
+    ///
+    /// An 8-bit value stands for anything within ±½ step. Plotted on a 1024-level
+    /// waveform, raw 8-bit data fills only every 4th level and shows as a comb of black
+    /// lines (and as a dot grid on the vectorscope). Each sample is therefore spread
+    /// over its quantisation interval with a fixed, repeatable ±½-step dither. Bins
+    /// stay within one source step of the exact value; no information is invented.
+    public var sourceQuantizationStep: Float = 1.0 / 255.0
 
     public init() {}
 }
@@ -82,6 +90,11 @@ public enum ScopeAnalyzer {
         var vsDensity = [UInt32](repeating: 0, count: vsSize * vsSize)
         var vsColor = [Float](repeating: 0, count: vsSize * vsSize * 3)
 
+        // Deterministic dither: a fixed 64x64 table of independent per-channel offsets
+        // in [-0.5, 0.5) * step, tiled over the image (same input -> same scopes).
+        let step = max(0, configuration.sourceQuantizationStep)
+        let ditherTable = step > 0 ? DitherTable.shared.scaled(by: step) : nil
+
         // Precompute image column -> waveform column.
         var columnMap = [Int](repeating: 0, count: width)
         for x in 0..<width { columnMap[x] = min(columns - 1, x * columns / width) }
@@ -105,8 +118,12 @@ public enum ScopeAnalyzer {
                 for y in 0..<height {
                     var p = y * width * 4
                     for x in 0..<width {
-                        let rv = px[p], gv = px[p + 1], bv = px[p + 2]
+                        var rv = px[p], gv = px[p + 1], bv = px[p + 2]
                         p += 4
+                        if let d = ditherTable {
+                            let t = ((y & 63) << 6 | (x & 63)) * 3
+                            rv += d[t]; gv += d[t + 1]; bv += d[t + 2]
+                        }
                         let col = columnMap[x]
                         let lum = Rec709.luma(rv, gv, bv)
                         r[level(rv) * columns + col] &+= 1
@@ -142,4 +159,21 @@ public enum ScopeAnalyzer {
         return ScopeAnalysis(waveform: waveform, vectorscope: vectorscope,
                              imageWidth: width, imageHeight: height)
     }
+}
+
+/// Fixed pseudo-random offsets in [-0.5, 0.5), generated with a seeded LCG so the
+/// scopes are reproducible run to run.
+final class DitherTable {
+    static let shared = DitherTable()
+    let unit: [Float]
+
+    private init() {
+        var state: UInt64 = 0x9E37_79B9_7F4A_7C15
+        unit = (0..<(64 * 64 * 3)).map { _ in
+            state = state &* 6364136223846793005 &+ 1442695040888963407
+            return Float(state >> 40) / Float(1 << 24) - 0.5
+        }
+    }
+
+    func scaled(by step: Float) -> [Float] { unit.map { $0 * step } }
 }

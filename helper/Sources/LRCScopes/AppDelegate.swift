@@ -14,6 +14,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var latestState: PluginState?
     private var hasFrame = false
     private var currentFrame: PluginState.Frame?
+    /// Keeps App Nap away: when the panel is hidden (outside Develop) macOS would
+    /// otherwise throttle our timers, the heartbeat would go stale and the plug-in
+    /// would treat the helper as gone.
+    private var activity: NSObjectProtocol?
 
     init(options: LaunchOptions) {
         self.options = options
@@ -24,6 +28,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep],
+                                                         reason: "Live scopes for Lightroom Classic")
         panel = ScopesPanelController(settings: ScopeSettings.load())
         panel.setMessage("Waiting for Lightroom Classic…")
         panel.onSettingsChanged = { [weak self] settings in
@@ -84,6 +90,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
 
         if let (jpeg, frame) = update.newFrame {
+            // A region is drawn on one particular photo; don't carry it to the next.
+            if let previous = currentFrame, previous.photoId != frame.photoId {
+                panel.resetRegion()
+            }
             currentFrame = frame
             hasFrame = true
             processor.submit(jpeg: jpeg, settings: panel.settings)

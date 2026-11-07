@@ -20,7 +20,13 @@ struct ScopeSettings: Equatable {
     var vectorscopeZoom: Int = 1          // 1x or 2x
     var colorizeVectorscope = true
     var showSkinToneLine = true
-    var gain: Float = 1.6
+    static let defaultGain: Float = 1.6
+    var gain: Float = ScopeSettings.defaultGain
+    /// Show the region navigator next to the scopes (persisted).
+    var showsRegionSelector = false
+    /// Area of the photo the scopes measure; nil = whole image. Deliberately not
+    /// persisted: a region only makes sense for the photo it was drawn on.
+    var region: ScopeRegion?
 
     var analyzerConfiguration: ScopeAnalyzerConfiguration {
         var c = ScopeAnalyzerConfiguration()
@@ -39,6 +45,7 @@ struct ScopeSettings: Equatable {
         static let colorize = "colorizeVectorscope"
         static let skin = "showSkinToneLine"
         static let gain = "gain"
+        static let regionSelector = "showsRegionSelector"
     }
 
     static func load(from defaults: UserDefaults = .standard) -> ScopeSettings {
@@ -51,6 +58,7 @@ struct ScopeSettings: Equatable {
         if defaults.object(forKey: Key.gain) != nil {
             s.gain = min(4, max(0.2, defaults.float(forKey: Key.gain)))
         }
+        if defaults.object(forKey: Key.regionSelector) != nil { s.showsRegionSelector = defaults.bool(forKey: Key.regionSelector) }
         return s
     }
 
@@ -61,5 +69,6 @@ struct ScopeSettings: Equatable {
         defaults.set(colorizeVectorscope, forKey: Key.colorize)
         defaults.set(showSkinToneLine, forKey: Key.skin)
         defaults.set(gain, forKey: Key.gain)
+        defaults.set(showsRegionSelector, forKey: Key.regionSelector)
     }
 }

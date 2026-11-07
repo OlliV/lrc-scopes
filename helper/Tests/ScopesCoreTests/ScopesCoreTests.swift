@@ -48,6 +48,7 @@ final class AnalyzerTests: XCTestCase {
         c.waveformLevels = 1024
         c.maxWaveformColumns = 64
         c.vectorscopeSize = 256
+        c.sourceQuantizationStep = 0 // exact-bin assertions
         return c
     }
 
@@ -225,5 +226,98 @@ final class GraticuleTests: XCTestCase {
             let magnitude = (c.cb * c.cb + c.cr * c.cr).squareRoot()
             XCTAssertLessThan(magnitude, ScopeAnalyzerConfiguration.defaultChromaAtEdge * 0.9, t.label)
         }
+    }
+}
+
+final class RegionTests: XCTestCase {
+    func testSpanningNormalisesAndClamps() {
+        let r = ScopeRegion.spanning((0.8, 0.9), (-0.2, 0.1))!
+        XCTAssertEqual(r.x, 0); XCTAssertEqual(r.y, 0.1, accuracy: 1e-12)
+        XCTAssertEqual(r.width, 0.8, accuracy: 1e-12); XCTAssertEqual(r.height, 0.8, accuracy: 1e-12)
+        XCTAssertNil(ScopeRegion.spanning((0.5, 0.5), (0.502, 0.9)), "sliver must be rejected")
+    }
+
+    func testPixelRectStaysInsideImage() {
+        let r = ScopeRegion(x: 0.999, y: 0.999, width: 0.01, height: 0.01).pixelRect(width: 100, height: 50)
+        XCTAssertEqual(r.x, 99); XCTAssertEqual(r.y, 49); XCTAssertEqual(r.width, 1); XCTAssertEqual(r.height, 1)
+        let full = ScopeRegion(x: 0, y: 0, width: 1, height: 1).pixelRect(width: 100, height: 50)
+        XCTAssertEqual(full.width, 100); XCTAssertEqual(full.height, 50)
+    }
+
+    func testCropSelectsTheRightPixels() {
+        // Left half black, right half white; top-right quadrant only must be white.
+        let img = ImageBuffer(width: 40, height: 20) { x, y in x >= 20 ? (1, 1, 1) : (0, 0, 0) }
+        let crop = img.cropped(to: ScopeRegion(x: 0.5, y: 0, width: 0.5, height: 0.5))
+        XCTAssertEqual(crop.width, 20); XCTAssertEqual(crop.height, 10)
+        XCTAssertTrue(stride(from: 0, to: crop.pixels.count, by: 4).allSatisfy { crop.pixels[$0] == 1 })
+        // Top-down orientation: a top-only marker must survive a top crop.
+        let marked = ImageBuffer(width: 10, height: 10) { _, y in y == 0 ? (1, 0, 0) : (0, 0, 0) }
+        let top = marked.cropped(to: ScopeRegion(x: 0, y: 0, width: 1, height: 0.1))
+        XCTAssertEqual(top.height, 1); XCTAssertEqual(top.pixels[0], 1)
+    }
+
+    func testRegionChangesTheScopes() {
+        let img = ImageBuffer(width: 40, height: 20) { x, _ in x >= 20 ? (1, 1, 1) : (0, 0, 0) }
+        let wf = ScopeAnalyzer.analyze(img.cropped(to: ScopeRegion(x: 0, y: 0, width: 0.5, height: 1))).waveform
+        XCTAssertEqual(wf.luma[wf.index(column: 0, level: wf.levels - 1)], 0, "white must not appear in a black-only region")
+        XCTAssertEqual(wf.columns, 20)
+    }
+
+    func testRotatedJPEGIsDisplayOriented() throws {
+        // 40x20 image, left half white, tagged "rotate 90° CW" (orientation 6):
+        // displayed it is 20x40 with the white half on top.
+        let cs = CGColorSpace(name: CGColorSpace.sRGB)!
+        let ctx = CGContext(data: nil, width: 40, height: 20, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: cs, bitmapInfo: CGImageAlphaInfo.noneSkipLast.rawValue)!
+        ctx.setFillColor(CGColor(colorSpace: cs, components: [0, 0, 0, 1])!)
+        ctx.fill(CGRect(x: 0, y: 0, width: 40, height: 20))
+        ctx.setFillColor(CGColor(colorSpace: cs, components: [1, 1, 1, 1])!)
+        ctx.fill(CGRect(x: 0, y: 0, width: 20, height: 20))
+        let data = NSMutableData()
+        let dest = CGImageDestinationCreateWithData(data, UTType.jpeg.identifier as CFString, 1, nil)!
+        CGImageDestinationAddImage(dest, ctx.makeImage()!, [kCGImagePropertyOrientation: 6] as CFDictionary)
+        XCTAssertTrue(CGImageDestinationFinalize(dest))
+
+        let buffer = try ImageDecoder.decode(data: data as Data, maxDimension: 100)
+        XCTAssertEqual(buffer.width, 20); XCTAssertEqual(buffer.height, 40)
+        XCTAssertGreaterThan(buffer.pixels[(5 * 20 + 10) * 4], 0.9, "top should be white")
+        XCTAssertLessThan(buffer.pixels[(35 * 20 + 10) * 4], 0.1, "bottom should be black")
+    }
+}
+
+final class DitherTests: XCTestCase {
+    /// 8-bit gradient: without dither only every ~4th level of 1024 is used.
+    private func gradient() -> ImageBuffer {
+        ImageBuffer(width: 256, height: 64) { x, _ in
+            let v = Float(x) / 255
+            return (v, v, v)
+        }
+    }
+
+    func testDitherFillsCombGaps() {
+        var exact = ScopeAnalyzerConfiguration(); exact.sourceQuantizationStep = 0
+        let comb = ScopeAnalyzer.analyze(gradient(), configuration: exact).waveform
+        let dithered = ScopeAnalyzer.analyze(gradient()).waveform
+        func usedLevels(_ wf: WaveformData) -> Int {
+            (0..<wf.levels).filter { l in (0..<wf.columns).contains { wf.luma[wf.index(column: $0, level: l)] > 0 } }.count
+        }
+        XCTAssertLessThanOrEqual(usedLevels(comb), 256)
+        XCTAssertGreaterThan(usedLevels(dithered), 900, "dither should populate nearly every level")
+    }
+
+    func testDitherStaysWithinOneSourceStep() {
+        // Every sample of value v must land within ±0.5/255 of v (≈ ±2 levels of 1023).
+        let img = ImageBuffer(width: 64, height: 64) { _, _ in (0.5, 0.5, 0.5) }
+        let wf = ScopeAnalyzer.analyze(img).waveform
+        let centre = Int((0.5 * 1023).rounded())
+        for l in 0..<wf.levels where wf.luma[wf.index(column: 0, level: l)] > 0 {
+            XCTAssertLessThanOrEqual(abs(l - centre), 3, "level \(l) too far from \(centre)")
+        }
+    }
+
+    func testDitherIsDeterministic() {
+        let a = ScopeAnalyzer.analyze(gradient()).waveform.luma
+        let b = ScopeAnalyzer.analyze(gradient()).waveform.luma
+        XCTAssertEqual(a, b)
     }
 }

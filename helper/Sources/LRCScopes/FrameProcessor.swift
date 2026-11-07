@@ -14,6 +14,10 @@ final class FrameProcessor {
         var waveformMode: WaveformMode
         var vectorscope: CGImage?
         var chromaAtEdge: Float
+        /// The whole decoded image, for the region navigator.
+        var navigatorImage: CGImage?
+        /// The region these scopes were computed for (nil = whole image).
+        var region: ScopeRegion?
         var processingTime: TimeInterval
     }
 
@@ -33,8 +37,10 @@ final class FrameProcessor {
 
     // Processing-queue state.
     private var image: ImageBuffer?
+    private var navigatorImage: CGImage?
     private var analysis: ScopeAnalysis?
     private var analysisConfig: ScopeAnalyzerConfiguration?
+    private var analysisRegion: ScopeRegion?
 
     func submit(jpeg: Data?, settings: ScopeSettings) {
         lock.lock()
@@ -49,6 +55,7 @@ final class FrameProcessor {
     func clear() {
         queue.async { [weak self] in
             self?.image = nil
+            self?.navigatorImage = nil
             self?.analysis = nil
             self?.analysisConfig = nil
         }
@@ -75,7 +82,9 @@ final class FrameProcessor {
         let start = CFAbsoluteTimeGetCurrent()
         if let jpeg {
             do {
-                image = try ImageDecoder.decode(data: jpeg, maxDimension: Self.analysisMaxDimension)
+                let decoded = try ImageDecoder.decode(data: jpeg, maxDimension: Self.analysisMaxDimension)
+                image = decoded
+                navigatorImage = decoded.makeDisplayImage()
                 analysis = nil
             } catch {
                 log.error("Decode failed: \(String(describing: error), privacy: .public)")
@@ -87,9 +96,11 @@ final class FrameProcessor {
         guard let image else { return }
 
         let config = settings.analyzerConfiguration
-        if analysis == nil || analysisConfig != config {
-            analysis = ScopeAnalyzer.analyze(image, configuration: config)
+        if analysis == nil || analysisConfig != config || analysisRegion != settings.region {
+            let source = settings.region.map { image.cropped(to: $0) } ?? image
+            analysis = ScopeAnalyzer.analyze(source, configuration: config)
             analysisConfig = config
+            analysisRegion = settings.region
         }
         guard let analysis else { return }
 
@@ -102,6 +113,7 @@ final class FrameProcessor {
             : nil
         let output = Output(waveform: wf, waveformMode: settings.waveformMode,
                             vectorscope: vs, chromaAtEdge: config.vectorscopeChromaAtEdge,
+                            navigatorImage: navigatorImage, region: settings.region,
                             processingTime: CFAbsoluteTimeGetCurrent() - start)
         DispatchQueue.main.async { [weak self] in self?.onOutput?(output) }
     }
