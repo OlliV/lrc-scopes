@@ -132,11 +132,14 @@ final class ScopesPanelController: NSWindowController, NSWindowDelegate {
     let regionButton = NSButton(title: "Region", target: nil, action: nil)
     let gainSlider = ResettableSlider(value: Double(ScopeSettings.defaultGain), minValue: 0.2, maxValue: 4, target: nil, action: nil)
 
-    init(settings: ScopeSettings) {
+    /// `closable` is only for a helper started by hand. Under the plug-in there is no
+    /// close button: visibility belongs to Show / Hide Scopes in Lightroom.
+    init(settings: ScopeSettings, closable: Bool = false) {
         self.settings = settings
+        var style: NSWindow.StyleMask = [.titled, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel]
+        if closable { style.insert(.closable) }
         let panel = NSPanel(contentRect: NSRect(origin: .zero, size: Self.defaultContentSize),
-                            styleMask: [.titled, .closable, .resizable, .utilityWindow, .hudWindow, .nonactivatingPanel],
-                            backing: .buffered, defer: true)
+                            styleMask: style, backing: .buffered, defer: true)
         panel.title = "Scopes"
         panel.isFloatingPanel = true
         panel.level = .floating
@@ -362,13 +365,6 @@ final class ScopesPanelController: NSWindowController, NSWindowDelegate {
     }
 
     // MARK: - NSWindowDelegate
-
-    /// The close button only hides the panel; the owner decides what closing means.
-    func windowShouldClose(_ sender: NSWindow) -> Bool {
-        saveFrame()
-        onUserClosed?()
-        return false
-    }
 
     func windowWillClose(_ notification: Notification) {
         saveFrame()

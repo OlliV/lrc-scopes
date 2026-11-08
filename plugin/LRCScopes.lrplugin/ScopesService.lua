@@ -91,7 +91,6 @@ local function newWorker(generation, context)
         launchRequestedAt = nil,
         launchAttempts = 0,
 
-        showSeq = 0,            -- incremented by Show Scopes (Protocol.state)
         lastStateSent = 0,
         nextEditPoll = 0,
         stateChanged = true,
@@ -113,7 +112,7 @@ function Worker:isActive()
 end
 
 function Worker:sendState(now)
-    if self.link:send(Protocol.state(self.enabled, self.module, self.photoId, self.photoName, self.showSeq)) then
+    if self.link:send(Protocol.state(self.enabled, self.module, self.photoId, self.photoName)) then
         self.lastStateSent = now
         self.stateChanged = false
     end
@@ -375,7 +374,6 @@ function Service.show()
     local worker = Service.worker
     if not worker then return true end
     worker.enabled = true
-    worker.showSeq = worker.showSeq + 1
     worker.stateChanged = true
     worker:markDirty(LrDate.currentTime())
     -- The user may have just closed the helper; don't wait for the periodic check.

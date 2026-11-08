@@ -4,7 +4,7 @@ One JSON object per line, terminated by "\n". Must match
 helper/Sources/ScopesCore/WireProtocol.swift:
 
   {"pluginVersion":"1.1.0","protocol":2,"type":"hello"}
-  {"enabled":true,"module":"develop","photo":{"id":1,"name":"A.CR3"},"showSeq":0,"type":"state"}
+  {"enabled":true,"module":"develop","photo":{"id":1,"name":"A.CR3"},"type":"state"}
   {"type":"frame","seq":7,"photoId":1,"renderMs":85,"sentAt":784249200.250,"jpeg":"<base64>"}
   {"photoId":1,"reason":"error loading thumb","type":"previewError"}
   {"type":"quit"}
@@ -81,15 +81,12 @@ function Protocol.hello(pluginVersion)
     return encode({ type = 'hello', ['protocol'] = Protocol.VERSION, pluginVersion = pluginVersion })
 end
 
---- showSeq counts Show Scopes choices; when it changes, the helper re-opens a panel
---- the user closed (closing only hides it; see HelperLink.lua for why).
-function Protocol.state(enabled, module, photoId, photoName, showSeq)
+function Protocol.state(enabled, module, photoId, photoName)
     return encode({
         type = 'state',
         enabled = enabled,
         module = module,
         photo = photoId and { id = photoId, name = photoName } or nil,
-        showSeq = showSeq,
     })
 end
 

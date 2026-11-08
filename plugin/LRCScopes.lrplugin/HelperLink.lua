@@ -8,9 +8,8 @@ LrSocket behaviour this is built around (LrC 15.6, observed):
     from the socket's own onClosed. So a socket that has had a client is never
     re-armed: when the link is lost, it is abandoned untouched and a fresh socket is
     bound on a new port for the next helper.
-  * Normally the helper never goes away while Lightroom runs: closing its window only
-    hides it, and Show Scopes brings it back (see `showSeq` in Protocol.state). Losing
-    the link is for crashes and force quits.
+  * Normally the helper never goes away while Lightroom runs: its panel has no close
+    button, only Show / Hide Scopes. Losing the link is for crashes and force quits.
   * A send-mode socket does not reliably report its client leaving (the connection
     sits in CLOSE_WAIT with no onClosed), so while connected the link checks every
     PROCESS_CHECK_INTERVAL that the helper process exists.

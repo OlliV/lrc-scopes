@@ -25,5 +25,5 @@ return {
         { title = LOC '$$$/LRCScopes/Menu/Hide=Hide Scopes', file = 'HideScopes.lua' },
     },
 
-    VERSION = { major = 1, minor = 1, revision = 0, build = 6 },
+    VERSION = { major = 1, minor = 1, revision = 0, build = 7 },
 }

@@ -256,8 +256,8 @@ do
     check(enc('Å.CR3') == '"Å.CR3"', 'UTF-8 passes through')
 
     check(Protocol.hello('1.1.0') == '{"pluginVersion":"1.1.0","protocol":2,"type":"hello"}', 'hello line: ' .. Protocol.hello('1.1.0'))
-    check(Protocol.state(true, 'develop', 42, 'DSC_0001.NEF', 3) ==
-        '{"enabled":true,"module":"develop","photo":{"id":42,"name":"DSC_0001.NEF"},"showSeq":3,"type":"state"}', 'state line')
+    check(Protocol.state(true, 'develop', 42, 'DSC_0001.NEF') ==
+        '{"enabled":true,"module":"develop","photo":{"id":42,"name":"DSC_0001.NEF"},"type":"state"}', 'state line')
     check(Protocol.state(false, 'library', nil, nil) == '{"enabled":false,"module":"library","type":"state"}', 'state without photo')
     check(Protocol.quit() == '{"type":"quit"}', 'quit line')
     local frame = Protocol.frame(7, 42, 'JPEGDATA-THAT-IS-LONG-ENOUGH-TO-WRAP', 12.4, 1000.5)
@@ -385,7 +385,7 @@ n = #target.requests
 target.editCount = target.editCount + 1
 advance(3)
 check(#target.requests == n, 'no requests while the helper is disconnected')
-check(#executed == 1, 'closing the panel does not relaunch the helper by itself')
+check(#executed == 1, 'a lost helper is not relaunched by itself')
 
 spawn(function() Service.show() end)
 advance(0.3)
@@ -413,12 +413,10 @@ n = #target.requests
 target.editCount = target.editCount + 1
 advance(2)
 check(#target.requests == n, 'no requests while hidden')
-local seqBefore = tonumber(lastOfType('state'):match('"showSeq":(%d+)'))
 spawn(function() Service.show() end)
 advance(1)
 check(prefs.enabled == true, 'show persisted')
-check(tonumber(lastOfType('state'):match('"showSeq":(%d+)')) == seqBefore + 1,
-    'Show Scopes bumps showSeq so a helper whose panel was closed re-opens it')
+check(lastOfType('state'):find('"enabled":true', 1, true), 'show sends enabled=true')
 check(#target.requests > n, 'show resumes rendering')
 check(#executed == 3, 'show does not relaunch a connected helper')
 

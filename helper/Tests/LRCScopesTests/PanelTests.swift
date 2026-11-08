@@ -92,18 +92,21 @@ final class PanelTests: XCTestCase {
         }
     }
 
-    func testCloseButtonOnlyHidesThePanel() throws {
+    func testPanelHasNoCloseButtonUnderThePlugin() throws {
         var closed = 0
         controller.onUserClosed = { closed += 1 }
         let window = try XCTUnwrap(controller.window)
         controller.show(true)
-        window.performClose(nil)
-        XCTAssertEqual(closed, 1, "owner is told")
-        XCTAssertTrue(window.isVisible, "the panel itself decides nothing; the owner hides it")
-        controller.show(false)
-        XCTAssertFalse(window.isVisible)
-        controller.show(true)
-        XCTAssertTrue(window.isVisible, "can be shown again after a close")
+        XCTAssertFalse(window.styleMask.contains(.closable))
+        XCTAssertNil(window.standardWindowButton(.closeButton).flatMap { $0.isEnabled ? $0 : nil })
+        window.performClose(nil) // also what Esc and Cmd-W end up doing
+        XCTAssertTrue(window.isVisible)
+        XCTAssertEqual(closed, 0)
+    }
+
+    func testHandStartedHelperCanBeClosed() throws {
+        let c = ScopesPanelController(settings: ScopeSettings(), closable: true)
+        XCTAssertTrue(try XCTUnwrap(c.window).styleMask.contains(.closable))
     }
 
     func testFrameMath() {

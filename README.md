@@ -45,8 +45,8 @@ Lightroom Classic                                LRC Scopes.app (bundled in the 
   then exits. Nothing touches the disk.
 * **Helper lifetime.** In LrC 15.6, calling `reconnect()` on an LrSocket whose client
   has gone away deadlocks Lightroom's main thread (send and receive mode alike). So
-  the helper runs for the whole Lightroom session: closing its window only hides it,
-  and Show Scopes re-opens it (`showSeq` in `state`). If the helper dies anyway (crash,
+  the helper runs for the whole Lightroom session: its panel has no close button, only
+  Show / Hide Scopes in Lightroom. If the helper dies anyway (crash,
   force quit), the plug-in notices within 2 s by checking for its process (a send
   socket doesn't report its client leaving), abandons that socket untouched and binds
   a fresh one for the next helper.
@@ -91,7 +91,7 @@ SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" scripts/build.sh
 ## Use
 
 * **File › Plug-in Extras › Show Scopes / Hide Scopes.** The choice is remembered across
-  launches. Closing the panel also hides the scopes until *Show Scopes* is chosen again.
+  launches. The panel has no close button; these menu items are how it is shown and hidden.
 * To bind a key: System Settings › Keyboard › Keyboard Shortcuts › App Shortcuts, add
   Adobe Lightroom Classic with the menu title `Show Scopes`.
 * **Region:** press *Region* to show a thumbnail of the photo, then drag on it to

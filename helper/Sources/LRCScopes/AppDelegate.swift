@@ -22,9 +22,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var previewError: (photoId: Int, reason: String?)?
     private var staleTraceCheck: DispatchWorkItem?
     private var terminating = false
-    /// The user closed the panel; it stays hidden until Show Scopes (a new showSeq).
-    private var userClosed = false
-    private var lastShowSeq: Int?
     private var stalenessTimer: Timer?
     /// Keeps App Nap away: when the panel is hidden (outside Develop) macOS would
     /// otherwise throttle the connection handling while Lightroom keeps sending.
@@ -39,23 +36,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                                                          reason: "Live scopes for Lightroom Classic")
         removeLegacySessionDirectory()
 
-        panel = ScopesPanelController(settings: ScopeSettings.load())
+        panel = ScopesPanelController(settings: ScopeSettings.load(), closable: options.port == nil)
         panel.setMessage("Waiting for Lightroom Classic…")
         panel.onSettingsChanged = { [weak self] settings in
             self?.processor.submit(jpeg: nil, settings: settings)
         }
         panel.onUserClosed = { [weak self] in
+            // Only a helper started by hand has a close button.
             guard let self, !self.terminating else { return }
-            guard self.options.port != nil else {
-                // Started by hand: nothing to come back to.
-                NSApp.terminate(nil)
-                return
-            }
-            // Keep running and connected: the plug-in can't safely reconnect to a new
-            // helper (see WireProtocol). Show Scopes in Lightroom re-opens the panel.
-            self.log.info("Scopes window closed by user; hiding until Show Scopes")
-            self.userClosed = true
-            self.updateVisibility()
+            NSApp.terminate(nil)
         }
 
         processor.onOutput = { [weak self] output in
@@ -134,13 +123,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         case .state(let state):
             let previousPhoto = latestState?.photo?.id
             latestState = state
-            if let seq = state.showSeq, seq != lastShowSeq {
-                if lastShowSeq != nil, userClosed {
-                    log.info("Show Scopes chosen; re-opening")
-                    userClosed = false
-                }
-                lastShowSeq = seq
-            }
             if state.photo == nil {
                 clearScopes()
             } else if state.photo?.id != previousPhoto, state.photo?.id != currentPhotoId {
@@ -246,7 +228,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// Lightroom is in Develop, and Lightroom (or the panel itself) is frontmost.
     private func updateVisibility() {
         if options.alwaysShow || options.port == nil { panel.show(true); return }
-        guard !userClosed, isPluginResponsive, let state = latestState, state.enabled, state.isInDevelop else {
+        guard isPluginResponsive, let state = latestState, state.enabled, state.isInDevelop else {
             panel.show(false)
             return
         }

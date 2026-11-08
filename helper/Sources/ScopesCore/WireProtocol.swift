@@ -7,7 +7,7 @@ import Foundation
 /// port) and launches the helper with `--port <n>`; the helper connects as a TCP
 /// client. Data flows plug-in -> helper only. The helper notices the plug-in going
 /// away from the connection closing or `staleAfter`. The helper stays running for
-/// the whole Lightroom session (closing the panel only hides it): re-arming an
+/// the whole Lightroom session (the panel has no close button): re-arming an
 /// LrSocket whose client has gone away deadlocks Lightroom, so the plug-in has to
 /// bind a fresh socket whenever a helper is lost (`HelperLink.lua`).
 ///
@@ -15,7 +15,7 @@ import Foundation
 /// ignored. Messages (see `PluginMessage`):
 ///
 ///   {"type":"hello","protocol":2,"pluginVersion":"1.1.0"}
-///   {"type":"state","enabled":true,"module":"develop","photo":{"id":1,"name":"A.CR3"},"showSeq":0}
+///   {"type":"state","enabled":true,"module":"develop","photo":{"id":1,"name":"A.CR3"}}
 ///   {"type":"frame","seq":7,"photoId":1,"renderMs":85,"sentAt":784249200.250,"jpeg":"<base64>"}
 ///   {"photoId":1,"reason":"error loading thumb","type":"previewError"}
 ///   {"type":"quit"}
@@ -42,16 +42,11 @@ public struct PluginState: Codable, Equatable {
     /// Lightroom module name as returned by `LrApplicationView.getCurrentModuleName()`.
     public var module: String?
     public var photo: Photo?
-    /// Incremented each time the user chooses Show Scopes. Closing the panel only
-    /// hides it (the helper must keep running; see `HelperLink.lua`); a new value
-    /// re-opens it.
-    public var showSeq: Int?
 
-    public init(enabled: Bool, module: String?, photo: Photo?, showSeq: Int? = nil) {
+    public init(enabled: Bool, module: String?, photo: Photo?) {
         self.enabled = enabled
         self.module = module
         self.photo = photo
-        self.showSeq = showSeq
     }
 
     public var isInDevelop: Bool { module == "develop" }
