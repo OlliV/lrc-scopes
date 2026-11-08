@@ -7,6 +7,8 @@ The scopes float over Lightroom in a non-activating panel (keyboard focus stays 
 Lightroom, so Develop shortcuts keep working). They appear only while Lightroom is
 frontmost and in Develop, and update as you edit.
 
+![The scopes panel: navigator, RGB parade with a 10-bit graticule, and a 2× vectorscope with the skin tone line](docs/scopes.png)
+
 ## Architecture
 
 Lightroom's SDK has no way to draw custom graphics inside the Develop module, and no
