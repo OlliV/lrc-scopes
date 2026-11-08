@@ -13,16 +13,17 @@ Lightroom's SDK has no way to draw custom graphics inside the Develop module, an
 access to the live Develop render. So the plug-in has two parts:
 
 ```
-Lightroom Classic                               LRC Scopes.app (bundled in the plug-in)
-┌───────────────────────────────┐              ┌──────────────────────────────────────┐
-│ LRCScopes.lrplugin (Lua)      │  session dir │ SessionClient   (dir watch, heartbeat)│
-│  ScopesService                │ ───────────▶ │ FrameProcessor  (decode → analyse →   │
-│   • target photo / module     │ state.json   │                  render, latest-wins) │
-│   • adjustment observer +     │ frame-N.jpg  │ ScopesCore      (pure scope math,     │
-│     editCount poll            │              │                  unit tested)         │
-│   • requestJpegThumbnail      │ ◀─────────── │ ScopesPanel     (AppKit HUD panel)    │
-│   • rate limiting, settling   │ helper.json  │                                       │
-└───────────────────────────────┘  (heartbeat) └──────────────────────────────────────┘
+Lightroom Classic                                LRC Scopes.app (bundled in the plug-in)
+┌────────────────────────────────┐              ┌────────────────────────────────────────┐
+│ LRCScopes.lrplugin (Lua)       │   LrSocket   │ PluginConnection (TCP client, reconnect)│
+│  ScopesService                 │  127.0.0.1   │ FrameProcessor   (decode → analyse →    │
+│   • target photo / module      │ ───────────▶ │                   render, latest-wins)  │
+│   • adjustment observer +      │ JSON lines:  │ ScopesCore       (pure scope math,      │
+│     editCount poll             │ hello, state,│                   unit tested)          │
+│   • requestJpegThumbnail       │ frame(base64)│ ScopesPanel      (AppKit HUD panel)     │
+│   • rate limiting, settling    │ quit         │                                         │
+│  HelperLink (send-mode socket) │              │                                         │
+└────────────────────────────────┘              └────────────────────────────────────────┘
 ```
 
 * **Image source.** `LrPhoto:requestJpegThumbnail` returns Lightroom's own rendering of
@@ -33,12 +34,20 @@ Lightroom Classic                               LRC Scopes.app (bundled in the p
 * **Change detection.** `LrDevelopController.addAdjustmentChangeObserver` for slider
   changes, plus a poll of `editCount`/`lastEditTime` for edits the observer misses
   (profile changes, masks, sync, undo, presets).
-* **IPC.** A versioned, file-based protocol in
-  `~/Library/Caches/com.lrcscopes.session` (see `SessionFiles.lua` and
-  `SessionProtocol.swift`). Every write is temp-file + `rename(2)`, so readers never see
-  partial files. Both sides publish heartbeats: the plug-in stops rendering when the
-  helper is gone; the helper hides when the plug-in is stale and exits when Lightroom
-  quits or the plug-in is disabled.
+* **IPC.** Lightroom's own `LrSocket`, in "send" mode on 127.0.0.1 at a
+  system-chosen port. The plug-in launches the helper with `--port <n>` and the helper
+  connects as a TCP client. Messages are one JSON object per line (`hello`, `state`,
+  `frame` with the JPEG in base64, `previewError`, `quit`; see `Protocol.lua` and
+  `WireProtocol.swift`). The plug-in sends `state` every second so the helper can tell
+  a hung Lightroom from a quiet one; the helper retries a dropped connection for 20 s,
+  then exits. Nothing touches the disk.
+* **Helper lifetime.** In LrC 15.6, calling `reconnect()` on an LrSocket whose client
+  has gone away deadlocks Lightroom's main thread (send and receive mode alike). So
+  the helper runs for the whole Lightroom session: closing its window only hides it,
+  and Show Scopes re-opens it (`showSeq` in `state`). If the helper dies anyway (crash,
+  force quit), the plug-in notices within 2 s by checking for its process (a send
+  socket doesn't report its client leaving), abandons that socket untouched and binds
+  a fresh one for the next helper.
 * **Scopes.** Computed from gamma-encoded R′G′B′ (as broadcast scopes and Resolve do).
   Waveform: 10-bit (0–1023) graticule, RGB overlay / parade / luma (Rec.709 Y′).
   Vectorscope: Rec.709 Cb/Cr, 75% target boxes, 100% target marks, skin tone line,
@@ -91,7 +100,7 @@ SIGN_IDENTITY="Developer ID Application: Your Name (TEAMID)" scripts/build.sh
   followed: the SDK can change the zoom but cannot read it or the visible area.
 * Plug-in Manager options: analysis resolution, debug logging.
 * Logs: `~/Library/Logs/Adobe/Lightroom/LrClassicLogs/LRCScopes.log` (plug-in) and
-  `log stream --predicate 'subsystem == "com.lrcscopes.helper"'` (helper).
+  `/usr/bin/log stream --predicate 'subsystem == "com.lrcscopes.helper"'` (helper).
 
 ## Layout
 

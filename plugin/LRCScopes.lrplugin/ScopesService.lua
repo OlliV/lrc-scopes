@@ -1,7 +1,8 @@
 --[[----------------------------------------------------------------------------
 ScopesService — the background task that feeds the helper with frames.
 
-One long-lived task per plug-in instance. Each tick it:
+One long-lived task per plug-in instance. It owns the LrSocket link to the helper
+(HelperLink.lua) and, each tick:
   * tracks the current module and target photo,
   * notices develop changes (LrDevelopController adjustment observer, plus an
     editCount/lastEditTime poll as a fallback for edits the observer misses, e.g.
@@ -9,9 +10,9 @@ One long-lived task per plug-in instance. Each tick it:
   * requests a fresh rendered preview (photo:requestJpegThumbnail) — rate limited,
     one request in flight, plus "settle" re-requests because Lightroom refines its
     previews shortly after an edit,
-  * writes frame-<seq>.jpg and state.json (see SessionFiles.lua) and a heartbeat.
+  * sends state (on change and as a keepalive) and frames to the helper.
 
-Nothing is rendered while the helper is not running, scopes are hidden, or
+Nothing is rendered while the helper isn't connected, scopes are hidden, or
 Lightroom is outside the Develop module, so the plug-in costs ~nothing then.
 ------------------------------------------------------------------------------]]
 
@@ -24,8 +25,9 @@ local LrPrefs = import 'LrPrefs'
 local LrTasks = import 'LrTasks'
 
 local HelperLauncher = require 'HelperLauncher'
+local HelperLink = require 'HelperLink'
 local Log = require 'Log'
-local SessionFiles = require 'SessionFiles'
+local Protocol = require 'Protocol'
 
 local PLUGIN_VERSION = (function()
     local ok, info = pcall(require, 'Info')
@@ -34,16 +36,16 @@ local PLUGIN_VERSION = (function()
 end)()
 
 -- Timing (seconds).
-local TICK_ACTIVE = 0.05        -- loop period while scopes are live
-local TICK_IDLE = 0.5           -- loop period otherwise
+local TICK_ACTIVE = 0.05          -- loop period while scopes are live
+local TICK_IDLE = 0.25            -- loop period otherwise (still services the socket)
 local MIN_REQUEST_INTERVAL = 0.12 -- caps preview requests at ~8/s while dragging sliders
 local SETTLE_DELAYS = { 0.5, 1.5, 4.0 } -- re-requests after the last change
-local REQUEST_TIMEOUT = 6       -- give up on a request whose callback never arrives
-local HANDLE_RETENTION = 20     -- keep request objects alive for late repeat callbacks
+local REQUEST_TIMEOUT = 6         -- give up on a request whose callback never arrives
+local HANDLE_RETENTION = 20       -- keep request objects alive for late repeat callbacks
 local EDIT_POLL_INTERVAL = 0.4
-local HEARTBEAT_INTERVAL = 1
-local HELPER_STALE_AFTER = 4
-local HELPER_LAUNCH_GRACE = 8   -- wait this long for a launched helper before retrying
+local KEEPALIVE_INTERVAL = 1      -- must be < WireProtocol.staleAfter in the helper
+-- (Helper liveness in the other direction: HelperLink.PROCESS_CHECK_INTERVAL.)
+local HELPER_LAUNCH_GRACE = 8     -- wait this long for a launched helper to connect
 local HELPER_LAUNCH_ATTEMPTS = 2
 
 local DEFAULT_PREVIEW_SIZE = 1024
@@ -61,12 +63,14 @@ local Service = {
 local Worker = {}
 Worker.__index = Worker
 
-local function newWorker(generation)
+local function newWorker(generation, context)
     local prefs = LrPrefs.prefsForPlugin()
     return setmetatable({
         generation = generation,
+        context = context,
         catalog = LrApplication.activeCatalog(),
         enabled = prefs.enabled ~= false,
+        link = nil,
         module = nil,
         photo = nil,
         photoId = nil,
@@ -81,15 +85,14 @@ local function newWorker(generation)
         handles = {},
 
         seq = 0,
-        frame = nil,
         lastJpeg = nil,
 
-        helperAlive = false,
-        nextHelperCheck = 0,
+        launchWanted = false,   -- launch as soon as the socket has a port
         launchRequestedAt = nil,
         launchAttempts = 0,
 
-        lastStateWrite = 0,
+        showSeq = 0,            -- incremented by Show Scopes (Protocol.state)
+        lastStateSent = 0,
         nextEditPoll = 0,
         stateChanged = true,
     }, Worker)
@@ -101,25 +104,33 @@ function Worker:markDirty(now)
     for i, delay in ipairs(SETTLE_DELAYS) do self.settleAt[i] = now + delay end
 end
 
-function Worker:isActive()
-    return self.enabled and self.helperAlive and self.module == 'develop' and self.photo ~= nil
+function Worker:helperConnected()
+    return self.link ~= nil and self.link.connected
 end
 
-function Worker:writeState(now, quit)
-    local state = {
-        ['protocol'] = SessionFiles.PROTOCOL,
-        pluginVersion = PLUGIN_VERSION,
-        heartbeat = now,
-        enabled = self.enabled,
-        quit = quit == true,
-        module = self.module,
-        photo = self.photoId and { id = self.photoId, name = self.photoName } or nil,
-        frame = self.frame,
-    }
-    if SessionFiles.atomicWrite(SessionFiles.path(SessionFiles.STATE_FILE), SessionFiles.encodeJSON(state)) then
-        self.lastStateWrite = now
+function Worker:isActive()
+    return self.enabled and self:helperConnected() and self.module == 'develop' and self.photo ~= nil
+end
+
+function Worker:sendState(now)
+    if self.link:send(Protocol.state(self.enabled, self.module, self.photoId, self.photoName, self.showSeq)) then
+        self.lastStateSent = now
         self.stateChanged = false
     end
+end
+
+function Worker:onHelperConnected()
+    self.launchRequestedAt = nil
+    self.launchAttempts = 0
+    self.link:send(Protocol.hello(PLUGIN_VERSION))
+    self.stateChanged = true
+    -- A new helper has no frame yet; send one even if the pixels are unchanged.
+    self.lastJpeg = nil
+    self:markDirty(LrDate.currentTime())
+end
+
+function Worker:onHelperDisconnected()
+    self.inflight = nil
 end
 
 -- Cheap fingerprint of the photo's edit history. editCount coalesces edits made
@@ -131,40 +142,41 @@ local function editStampOf(photo)
     return ok and stamp or nil
 end
 
-function Worker:updateHelperStatus(now)
-    if now < self.nextHelperCheck then return end
-    self.nextHelperCheck = now + 1
-    local age = SessionFiles.helperHeartbeatAge()
-    local alive = age ~= nil and age < HELPER_STALE_AFTER
-    if alive ~= self.helperAlive then
-        Log.info('Helper %s', alive and 'connected' or 'disconnected')
-        self.helperAlive = alive
-        if alive then
-            self.launchRequestedAt = nil
-            self.launchAttempts = 0
-            -- A (re)started helper has no frame yet; send one even if unchanged.
-            self.lastJpeg = nil
-            self:markDirty(now)
-        end
-        self.stateChanged = true
+--- Launches (or relaunches) the helper once the socket knows its port.
+function Worker:manageHelper(now)
+    if not self.enabled or self:helperConnected() then
+        self.launchWanted = false
+        return
     end
-    -- A helper launch can race with a previous helper instance that is just exiting
-    -- (e.g. plug-in reload). Retry a bounded number of times.
-    if not alive and self.enabled and self.launchRequestedAt
-        and now - self.launchRequestedAt > HELPER_LAUNCH_GRACE then
+    local port = self.link.port
+    if self.launchWanted and port then
+        self.launchWanted = false
+        self.launchAttempts = self.launchAttempts + 1
+        self.launchRequestedAt = now
+        local ok, reason = HelperLauncher.launch(port)
+        if not ok then
+            Log.error('Helper not started: %s', tostring(reason))
+            self.launchRequestedAt = nil
+            self.launchError = reason
+        end
+        return
+    end
+    -- A launched helper that never connects (e.g. it raced with an exiting older
+    -- instance) gets a bounded number of retries.
+    if self.launchRequestedAt and now - self.launchRequestedAt > HELPER_LAUNCH_GRACE then
         if self.launchAttempts < HELPER_LAUNCH_ATTEMPTS then
-            self:launchHelper(now)
+            self.launchWanted = true
         else
-            Log.warn('Helper did not start after %d attempts', self.launchAttempts)
+            Log.warn('Helper did not connect after %d attempts', self.launchAttempts)
             self.launchRequestedAt = nil
         end
     end
 end
 
-function Worker:launchHelper(now)
-    self.launchAttempts = self.launchAttempts + 1
-    self.launchRequestedAt = now
-    return HelperLauncher.launch()
+function Worker:requestLaunch()
+    self.launchAttempts = 0
+    self.launchError = nil
+    self.launchWanted = true
 end
 
 function Worker:trackTarget(now)
@@ -180,14 +192,13 @@ function Worker:trackTarget(now)
     -- service's function context.
     if module == 'develop' and not self.observerAdded then
         local ok, err = LrTasks.pcall(LrDevelopController.addAdjustmentChangeObserver,
-            Service.context, self, function(worker) worker:markDirty(LrDate.currentTime()) end)
+            self.context, self, function(worker) worker:markDirty(LrDate.currentTime()) end)
         if ok then
-            self.observerAdded = true
             Log.trace('Adjustment observer registered')
         else
             Log.warn('Could not register adjustment observer: %s', tostring(err))
-            self.observerAdded = true -- don't retry every tick; the edit poll covers us
         end
+        self.observerAdded = true -- don't retry every tick; the edit poll covers us
     end
 
     local photo = self.catalog:getTargetPhoto()
@@ -226,22 +237,27 @@ end
 function Worker:onThumbnail(request, jpeg, err)
     if self.inflight == request then self.inflight = nil end
     if Service.worker ~= self then return end -- service restarted meanwhile
+    if request.photoId ~= self.photoId then return end -- user moved on
     if not jpeg then
         Log.warn('Preview request failed for %s: %s', tostring(self.photoName), tostring(err))
+        -- Only tell the helper if it has nothing for this photo yet; otherwise the last
+        -- good frame stays up. Settle re-requests keep retrying meanwhile.
+        if self.lastJpeg == nil then
+            self.link:send(Protocol.previewError(request.photoId, tostring(err or 'unknown error')))
+        end
         return
     end
-    if request.photoId ~= self.photoId then return end -- user moved on
     if jpeg == self.lastJpeg then return end         -- identical rendering, nothing new
 
     local seq = self.seq + 1
-    local name = SessionFiles.frameName(seq)
-    if not SessionFiles.atomicWrite(SessionFiles.path(name), jpeg) then return end
-    self.seq = seq
-    self.lastJpeg = jpeg
-    self.frame = { seq = seq, file = name, photoId = request.photoId }
-    self:writeState(LrDate.currentTime())
-    SessionFiles.deleteFrame(seq - SessionFiles.FRAMES_TO_KEEP)
-    Log.trace('Frame %d (%d bytes, %.0f ms)', seq, #jpeg, (LrDate.currentTime() - request.startedAt) * 1000)
+    local startedSend = LrDate.currentTime()
+    local renderMs = (startedSend - request.startedAt) * 1000
+    if self.link:send(Protocol.frame(seq, request.photoId, jpeg, renderMs, startedSend)) then
+        self.seq = seq
+        self.lastJpeg = jpeg
+        Log.trace('Frame %d: %d bytes, rendered in %.0f ms, sent in %.0f ms', seq, #jpeg,
+            renderMs, (LrDate.currentTime() - startedSend) * 1000)
+    end
 end
 
 function Worker:requestFrame(now)
@@ -279,7 +295,8 @@ end
 
 function Worker:tick()
     local now = LrDate.currentTime()
-    self:updateHelperStatus(now)
+    self.link:tick() -- delivers connect/disconnect, re-arms the socket
+    self:manageHelper(now)
     self:trackTarget(now)
 
     if self:isActive() then
@@ -288,8 +305,8 @@ function Worker:tick()
     end
     self:pruneHandles(now)
 
-    if self.stateChanged or now - self.lastStateWrite >= HEARTBEAT_INTERVAL then
-        self:writeState(now)
+    if self:helperConnected() and (self.stateChanged or now - self.lastStateSent >= KEEPALIVE_INTERVAL) then
+        self:sendState(now)
     end
     return self:isActive() and TICK_ACTIVE or TICK_IDLE
 end
@@ -298,8 +315,7 @@ end
 -- Public API
 ---------------------------------------------------------------------------------
 
---- Starts the background service (idempotent). Must not be called from a task-less
---- context that forbids starting tasks; all Lightroom entry points allow it.
+--- Starts the background service (idempotent).
 function Service.start()
     if Service.running then return end
     if not MAC_ENV then
@@ -312,33 +328,21 @@ function Service.start()
 
     LrTasks.startAsyncTask(function()
         LrFunctionContext.callWithContext('LRCScopes.service', function(context)
-            Service.context = context
-            if not SessionFiles.ensureDirectory() then
-                Log.error('Cannot create session directory %s', SessionFiles.directory())
+            local worker = newWorker(generation, context)
+            local opened, openErr = LrTasks.pcall(function()
+                worker.link = HelperLink.open(context, {
+                    onConnected = function() worker:onHelperConnected() end,
+                    onDisconnected = function() worker:onHelperDisconnected() end,
+                })
+            end)
+            if not opened then
+                Log.error('Cannot open the helper socket: %s', tostring(openErr))
                 Service.running = false
                 return
             end
-            SessionFiles.clean()
-
-            local worker = newWorker(generation)
             Service.worker = worker
             Log.info('Service started (generation %d)', generation)
-
-            -- Replace any state left by a previous session (which may say quit=true)
-            -- before the helper can read it.
-            local started, startErr = LrTasks.pcall(function()
-                local now = LrDate.currentTime()
-                worker:trackTarget(now)
-                worker:writeState(now)
-                if worker.enabled then
-                    local ok, reason = worker:launchHelper(now)
-                    if not ok then Log.error('Helper not started: %s', tostring(reason)) end
-                end
-            end)
-            if not started then
-                -- Keep going: the loop retries everything each tick.
-                Log.error('Service startup failed: %s', tostring(startErr))
-            end
+            if worker.enabled then worker:requestLaunch() end
 
             local failures = 0
             while Service.running and Service.generation == generation do
@@ -353,13 +357,15 @@ function Service.start()
                 LrTasks.sleep(delay)
             end
 
+            worker.link:close()
             if Service.worker == worker then Service.worker = nil end
             Log.info('Service stopped (generation %d)', generation)
         end)
     end, 'LRCScopes.service')
 end
 
---- Shows the scopes: persists the choice and (re)launches the helper if needed.
+--- Shows the scopes: persists the choice and launches the helper if it isn't
+--- connected. Returns false plus a reason if the helper can't be started.
 function Service.show()
     LrPrefs.prefsForPlugin().enabled = true
     if not Service.running then
@@ -369,12 +375,18 @@ function Service.show()
     local worker = Service.worker
     if not worker then return true end
     worker.enabled = true
+    worker.showSeq = worker.showSeq + 1
     worker.stateChanged = true
-    worker.launchAttempts = 0
-    local now = LrDate.currentTime()
-    worker:markDirty(now)
-    if not worker.helperAlive then
-        return worker:launchHelper(now)
+    worker:markDirty(LrDate.currentTime())
+    -- The user may have just closed the helper; don't wait for the periodic check.
+    if worker:helperConnected() then worker.link:verify() end
+    if not worker:helperConnected() then
+        worker:requestLaunch()
+        -- Launch happens on the service task; surface an immediate failure here.
+        if worker.link.port then
+            worker:manageHelper(LrDate.currentTime())
+            if worker.launchError then return false, worker.launchError end
+        end
     end
     return true
 end
@@ -385,8 +397,9 @@ function Service.hide()
     local worker = Service.worker
     if worker then
         worker.enabled = false
+        worker.launchWanted = false
         worker.launchRequestedAt = nil
-        worker:writeState(LrDate.currentTime())
+        if worker:helperConnected() then worker:sendState(LrDate.currentTime()) end
     end
 end
 
@@ -395,14 +408,12 @@ function Service.shutdown()
     local worker = Service.worker
     Service.running = false
     Service.generation = Service.generation + 1
-    if worker then
-        worker:writeState(LrDate.currentTime(), true)
-    else
-        -- Still let a running helper know it should go away.
-        SessionFiles.atomicWrite(SessionFiles.path(SessionFiles.STATE_FILE), SessionFiles.encodeJSON({
-            ['protocol'] = SessionFiles.PROTOCOL, heartbeat = LrDate.currentTime(), enabled = false, quit = true,
-        }))
+    if worker and worker.link then
+        worker.link:send(Protocol.quit())
+        worker.link:close()
     end
+    -- If the socket is already gone the helper notices the closed connection, and
+    -- it also exits when Lightroom quits.
     Service.worker = nil
 end
 

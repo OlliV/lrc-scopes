@@ -363,6 +363,13 @@ final class ScopesPanelController: NSWindowController, NSWindowDelegate {
 
     // MARK: - NSWindowDelegate
 
+    /// The close button only hides the panel; the owner decides what closing means.
+    func windowShouldClose(_ sender: NSWindow) -> Bool {
+        saveFrame()
+        onUserClosed?()
+        return false
+    }
+
     func windowWillClose(_ notification: Notification) {
         saveFrame()
         onUserClosed?()

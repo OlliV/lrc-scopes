@@ -7,59 +7,66 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private let log = Logger(subsystem: "com.lrcscopes.helper", category: "app")
     private let options: LaunchOptions
-    private var session: SessionClient!
+    private var connection: PluginConnection?
     private let processor = FrameProcessor()
     private var panel: ScopesPanelController!
 
+    private var connected = false
+    private var protocolMismatch: Int?
     private var latestState: PluginState?
+    private var lastMessageAt: Date?
+    private var currentPhotoId: Int?
     private var hasFrame = false
-    private var currentFrame: PluginState.Frame?
+    private var previewSize: (width: Int, height: Int)?
+    /// Set when Lightroom could not render the current photo.
+    private var previewError: (photoId: Int, reason: String?)?
+    private var staleTraceCheck: DispatchWorkItem?
+    private var terminating = false
+    /// The user closed the panel; it stays hidden until Show Scopes (a new showSeq).
+    private var userClosed = false
+    private var lastShowSeq: Int?
+    private var stalenessTimer: Timer?
     /// Keeps App Nap away: when the panel is hidden (outside Develop) macOS would
-    /// otherwise throttle our timers, the heartbeat would go stale and the plug-in
-    /// would treat the helper as gone.
+    /// otherwise throttle the connection handling while Lightroom keeps sending.
     private var activity: NSObjectProtocol?
 
     init(options: LaunchOptions) {
         self.options = options
     }
 
-    var version: String {
-        Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "dev"
-    }
-
     func applicationDidFinishLaunching(_ notification: Notification) {
         activity = ProcessInfo.processInfo.beginActivity(options: [.userInitiatedAllowingIdleSystemSleep],
                                                          reason: "Live scopes for Lightroom Classic")
+        removeLegacySessionDirectory()
+
         panel = ScopesPanelController(settings: ScopeSettings.load())
         panel.setMessage("Waiting for Lightroom Classic…")
         panel.onSettingsChanged = { [weak self] settings in
             self?.processor.submit(jpeg: nil, settings: settings)
         }
         panel.onUserClosed = { [weak self] in
-            self?.log.info("Scopes window closed by user; exiting")
-            NSApp.terminate(nil)
+            guard let self, !self.terminating else { return }
+            guard self.options.port != nil else {
+                // Started by hand: nothing to come back to.
+                NSApp.terminate(nil)
+                return
+            }
+            // Keep running and connected: the plug-in can't safely reconnect to a new
+            // helper (see WireProtocol). Show Scopes in Lightroom re-opens the panel.
+            self.log.info("Scopes window closed by user; hiding until Show Scopes")
+            self.userClosed = true
+            self.updateVisibility()
         }
 
         processor.onOutput = { [weak self] output in
             guard let self else { return }
             self.panel.display(output)
+            self.previewSize = output.previewSize
+            self.updateStatusAndMessage()
             self.log.debug("Frame processed in \(output.processingTime * 1000, format: .fixed(precision: 1)) ms")
         }
         processor.onError = { [weak self] message in
             self?.panel.setMessage("Could not read the preview from Lightroom.\n\(message)")
-        }
-
-        session = SessionClient(directory: options.sessionDirectory, version: version)
-        session.onUpdate = { [weak self] update in self?.handle(update) }
-        do {
-            try session.start()
-        } catch {
-            log.fault("Cannot watch session directory: \(String(describing: error), privacy: .public)")
-            let alert = NSAlert(error: error)
-            alert.messageText = "LRC Scopes cannot access its session folder."
-            alert.runModal()
-            NSApp.terminate(nil)
-            return
         }
 
         let center = NSWorkspace.shared.notificationCenter
@@ -68,64 +75,165 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         center.addObserver(self, selector: #selector(appTerminated(_:)),
                            name: NSWorkspace.didTerminateApplicationNotification, object: nil)
 
-        if options.alwaysShow { panel.show(true) }
+        if let port = options.port {
+            let c = PluginConnection(port: port)
+            c.onEvent = { [weak self] event in self?.handle(event) }
+            c.start()
+            connection = c
+        } else {
+            // Started by hand rather than by the plug-in: there is nothing to connect to.
+            panel.setMessage("Open the scopes from Lightroom Classic:\nFile › Plug-in Extras › Show Scopes")
+            panel.show(true)
+        }
+
+        // Staleness is a function of time, not of events.
+        stalenessTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            self?.updateStatusAndMessage()
+            self?.updateVisibility()
+        }
         updateVisibility()
     }
 
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        terminating = true
+        return .terminateNow
+    }
+
     func applicationWillTerminate(_ notification: Notification) {
-        session?.stop()
+        connection?.stop()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
 
-    // MARK: - State handling
+    // MARK: - Connection events
 
-    private func handle(_ update: SessionClient.Update) {
-        latestState = update.state
-
-        if let state = update.state, state.quit == true {
-            log.info("Plug-in requested exit")
+    private func handle(_ event: PluginConnection.Event) {
+        switch event {
+        case .connected:
+            connected = true
+            lastMessageAt = Date()
+        case .disconnected:
+            connected = false
+        case .gaveUp:
+            log.info("Lost Lightroom; exiting")
             NSApp.terminate(nil)
             return
+        case .message(let message):
+            lastMessageAt = Date()
+            handle(message)
         }
-
-        if let (jpeg, frame) = update.newFrame {
-            // A region is drawn on one particular photo; don't carry it to the next.
-            if let previous = currentFrame, previous.photoId != frame.photoId {
-                panel.resetRegion()
-            }
-            currentFrame = frame
-            hasFrame = true
-            processor.submit(jpeg: jpeg, settings: panel.settings)
-        }
-
         updateStatusAndMessage()
         updateVisibility()
     }
 
+    private func handle(_ message: PluginMessage) {
+        switch message {
+        case .hello(let version, let pluginVersion):
+            log.info("Plug-in \(pluginVersion ?? "?", privacy: .public), protocol \(version)")
+            protocolMismatch = version == WireProtocol.version ? nil : version
+        case .state(let state):
+            let previousPhoto = latestState?.photo?.id
+            latestState = state
+            if let seq = state.showSeq, seq != lastShowSeq {
+                if lastShowSeq != nil, userClosed {
+                    log.info("Show Scopes chosen; re-opening")
+                    userClosed = false
+                }
+                lastShowSeq = seq
+            }
+            if state.photo == nil {
+                clearScopes()
+            } else if state.photo?.id != previousPhoto, state.photo?.id != currentPhotoId {
+                scheduleStaleTraceCheck()
+            }
+        case .frame(let frame):
+            guard protocolMismatch == nil else { return }
+            logFrame(frame)
+            // A region is drawn on one particular photo; don't carry it to the next.
+            if let previous = currentPhotoId, previous != frame.photoId {
+                panel.resetRegion()
+            }
+            currentPhotoId = frame.photoId
+            previewError = nil
+            hasFrame = true
+            processor.submit(jpeg: frame.jpeg, settings: panel.settings)
+        case .previewError(let photoId, let reason):
+            log.error("Lightroom could not render a preview: \(reason ?? "?", privacy: .public)")
+            guard photoId == latestState?.photo?.id else { return }
+            previewError = (photoId, reason)
+            clearScopes()
+        case .quit:
+            log.info("Plug-in requested exit")
+            NSApp.terminate(nil)
+        }
+    }
+
+    private func clearScopes() {
+        hasFrame = false
+        previewSize = nil
+        currentPhotoId = nil
+        panel.clearTraces()
+    }
+
+    /// When another photo is selected, its frame normally arrives within a fraction of
+    /// a second. If it doesn't, stop showing the previous photo's scopes rather than
+    /// leave them up under the new photo's name.
+    private func scheduleStaleTraceCheck() {
+        staleTraceCheck?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            guard let self, let photo = self.latestState?.photo, self.currentPhotoId != photo.id else { return }
+            self.clearScopes()
+            self.updateStatusAndMessage()
+        }
+        staleTraceCheck = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4, execute: item)
+    }
+
+    private func logFrame(_ frame: FrameMessage) {
+        let transferMs = frame.sentAt.map { (Date().timeIntervalSinceReferenceDate - $0) * 1000 }
+        log.debug("Frame \(frame.seq): \(frame.jpeg.count) bytes, render \(frame.renderMs ?? -1) ms, transfer \(transferMs ?? -1, format: .fixed(precision: 1)) ms")
+    }
+
+    private var isPluginResponsive: Bool {
+        guard connected, let last = lastMessageAt else { return false }
+        return Date().timeIntervalSince(last) <= WireProtocol.staleAfter
+    }
+
+    // MARK: - Presentation
+
     private func updateStatusAndMessage() {
-        guard let state = latestState else {
+        guard options.port != nil else { return }
+        if let v = protocolMismatch {
             panel.setStatus("")
-            panel.setMessage("Waiting for Lightroom Classic…\nEnable the LRC Scopes plug-in in the Plug-in Manager.")
+            panel.setMessage("The scopes app and the Lightroom plug-in don't match (protocol \(v) vs \(WireProtocol.version)).\nReinstall the LRC Scopes plug-in.")
             return
         }
-        if !state.isFresh() {
+        guard connected, let state = latestState else {
+            panel.setStatus("")
+            panel.setMessage("Waiting for Lightroom Classic…")
+            return
+        }
+        guard isPluginResponsive else {
             panel.setStatus("")
             panel.setMessage("Lightroom is not responding to the scopes plug-in.")
             return
         }
-        if state.photo == nil {
-            panel.clearTraces()
-            hasFrame = false
+        guard let photo = state.photo else {
             panel.setStatus("")
             panel.setMessage("No photo selected.")
             return
         }
-        let name = state.photo?.name ?? ""
-        if let frame = currentFrame, let photo = state.photo, frame.photoId != photo.id {
+        let name = photo.name ?? ""
+        if let error = previewError, error.photoId == photo.id {
+            panel.setStatus(name)
+            panel.setMessage("Lightroom could not render a preview of this photo" +
+                             (error.reason.map { " (\($0))" } ?? "") + ".\nRetrying…")
+            return
+        }
+        if currentPhotoId != photo.id {
             panel.setStatus("\(name) — updating…")
-        } else if let frame = currentFrame, let w = frame.width, let h = frame.height {
-            panel.setStatus("\(name) — \(w)×\(h) preview")
+        } else if let size = previewSize {
+            panel.setStatus("\(name) — \(size.width)×\(size.height) preview")
         } else {
             panel.setStatus(name)
         }
@@ -137,8 +245,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     /// The panel is shown only while it is useful: the plug-in is alive and enabled,
     /// Lightroom is in Develop, and Lightroom (or the panel itself) is frontmost.
     private func updateVisibility() {
-        if options.alwaysShow { panel.show(true); return }
-        guard let state = latestState, state.isFresh(), state.enabled, state.isInDevelop else {
+        if options.alwaysShow || options.port == nil { panel.show(true); return }
+        guard !userClosed, isPluginResponsive, let state = latestState, state.enabled, state.isInDevelop else {
             panel.show(false)
             return
         }
@@ -159,10 +267,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             NSApp.terminate(nil)
         }
     }
+
+    /// Protocol 1 exchanged files in this folder. It only ever held this app's own
+    /// frames and state, so it is safe to remove.
+    private func removeLegacySessionDirectory() {
+        let legacy = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Caches/com.lrcscopes.session", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: legacy.path) else { return }
+        do {
+            try FileManager.default.removeItem(at: legacy)
+            log.info("Removed legacy session folder")
+        } catch {
+            log.error("Could not remove legacy session folder: \(String(describing: error), privacy: .public)")
+        }
+    }
 }
 
-struct LaunchOptions {
-    var sessionDirectory: URL = SessionProtocol.defaultSessionDirectory
+struct LaunchOptions: Equatable {
+    /// The plug-in's LrSocket port. nil when started by hand.
+    var port: UInt16?
     /// Debug aid: keep the panel visible regardless of Lightroom state.
     var alwaysShow = false
 
@@ -171,10 +294,8 @@ struct LaunchOptions {
         var it = arguments.dropFirst().makeIterator()
         while let arg = it.next() {
             switch arg {
-            case "--session-dir":
-                if let path = it.next(), !path.isEmpty {
-                    o.sessionDirectory = URL(fileURLWithPath: (path as NSString).expandingTildeInPath, isDirectory: true)
-                }
+            case "--port":
+                if let value = it.next(), let port = UInt16(value), port > 0 { o.port = port }
             case "--always-show":
                 o.alwaysShow = true
             default:

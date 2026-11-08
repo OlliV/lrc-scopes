@@ -2,13 +2,11 @@
 
 local LrDialogs = import 'LrDialogs'
 local LrPrefs = import 'LrPrefs'
-local LrShell = import 'LrShell'
 local LrTasks = import 'LrTasks'
 local LrView = import 'LrView'
 
 local Log = require 'Log'
 local ScopesService = require 'ScopesService'
-local SessionFiles = require 'SessionFiles'
 
 local function sectionsForTopOfDialog(f, propertyTable)
     local prefs = LrPrefs.prefsForPlugin()
@@ -66,13 +64,6 @@ local function sectionsForTopOfDialog(f, propertyTable)
                                 LrDialogs.message(LOC '$$$/LRCScopes/Error/Title=Scopes could not be shown', reason, 'critical')
                             end
                         end)
-                    end,
-                },
-                f:push_button {
-                    title = LOC '$$$/LRCScopes/Settings/Reveal=Show Session Folder',
-                    action = function()
-                        SessionFiles.ensureDirectory()
-                        LrShell.revealInShell(SessionFiles.path(SessionFiles.STATE_FILE))
                     end,
                 },
             },

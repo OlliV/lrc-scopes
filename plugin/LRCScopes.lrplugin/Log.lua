@@ -1,6 +1,7 @@
 --[[ Shared logger.
-Warnings and errors always go to the log file; info/trace only when "Debug logging"
-is enabled in the Plug-in Manager. The file lives in Lightroom's plug-in log folder
+Errors, warnings and info (rare lifecycle events: start/stop, helper launch,
+connect/disconnect) always go to the log file; per-frame trace output only when
+"Debug logging" is enabled in the Plug-in Manager. The file lives in Lightroom's plug-in log folder
 (~/Library/Logs/Adobe/Lightroom/LrClassicLogs/LRCScopes.log on current versions). ]]
 
 local LrLogger = import 'LrLogger'
@@ -16,7 +17,7 @@ function Log.configure()
     if debug then
         logger:enable('logfile')
     else
-        logger:enable({ fatal = 'logfile', error = 'logfile', warn = 'logfile' })
+        logger:enable({ fatal = 'logfile', error = 'logfile', warn = 'logfile', info = 'logfile' })
     end
 end
 

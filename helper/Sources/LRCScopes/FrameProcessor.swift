@@ -18,6 +18,8 @@ final class FrameProcessor {
         var navigatorImage: CGImage?
         /// The region these scopes were computed for (nil = whole image).
         var region: ScopeRegion?
+        /// Pixel size of the preview Lightroom sent (after decoding, before any region).
+        var previewSize: (width: Int, height: Int)?
         var processingTime: TimeInterval
     }
 
@@ -114,6 +116,7 @@ final class FrameProcessor {
         let output = Output(waveform: wf, waveformMode: settings.waveformMode,
                             vectorscope: vs, chromaAtEdge: config.vectorscopeChromaAtEdge,
                             navigatorImage: navigatorImage, region: settings.region,
+                            previewSize: (image.width, image.height),
                             processingTime: CFAbsoluteTimeGetCurrent() - start)
         DispatchQueue.main.async { [weak self] in self?.onOutput?(output) }
     }

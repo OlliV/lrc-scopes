@@ -1,7 +1,8 @@
 --[[ Offline tests for the plug-in logic.
 
-Runs the real plug-in modules against a stubbed Lightroom SDK with a simulated
-clock and cooperative task scheduler. Usage (from the repository root):
+Runs the real plug-in modules against a stubbed Lightroom SDK (including a fake
+LrSocket) with a simulated clock and cooperative task scheduler. Usage (from the
+repository root):
 
     lua plugin/tests/run_tests.lua
 ]]
@@ -9,9 +10,8 @@ clock and cooperative task scheduler. Usage (from the repository root):
 local pluginDir = arg[0]:match('^(.*)/tests/[^/]+$') .. '/LRCScopes.lrplugin'
 package.path = pluginDir .. '/?.lua;' .. package.path
 
-local tmpRoot = os.getenv('TMPDIR') or '/tmp'
-local home = string.format('%s/lrcscopes-test-%d', tmpRoot:gsub('/$', ''), os.time())
-os.execute('mkdir -p ' .. home)
+local tmpRoot = (os.getenv('TMPDIR') or '/tmp'):gsub('/$', '')
+local home = string.format('%s/lrcscopes-test-%d', tmpRoot, os.time())
 
 ---------------------------------------------------------------------------------
 -- Simulated clock + scheduler
@@ -21,11 +21,9 @@ local clock = 1000
 local tasks = {} -- { co, wakeAt }
 
 local function spawn(fn)
-    local co = coroutine.create(fn)
-    tasks[#tasks + 1] = { co = co, wakeAt = clock }
+    tasks[#tasks + 1] = { co = coroutine.create(fn), wakeAt = clock }
 end
 
---- Runs tasks until the simulated clock reaches `untilTime`.
 local function runUntil(untilTime)
     while true do
         local nextTask, nextAt
@@ -45,12 +43,73 @@ end
 local function advance(seconds) runUntil(clock + seconds) end
 
 ---------------------------------------------------------------------------------
--- SDK stubs
+-- Fake LrSocket: records binds and sends; the test plays the helper's part.
 ---------------------------------------------------------------------------------
 
-local executed = {}
+local sockets = {}
+
+local FakeSocket = {}
+FakeSocket.__index = FakeSocket
+
+function FakeSocket:send(message)
+    assert(self.mode == 'send', 'send on a non-send socket')
+    assert(self.peer, 'send while no client is connected')
+    self.sent[#self.sent + 1] = message
+end
+function FakeSocket:reconnect()
+    -- LrC 15.6 deadlocks its main thread when a socket whose client has gone away is
+    -- re-armed. Only a socket that never had a client may be (listen timeout).
+    assert(not self.hadPeer, 'reconnect() on a socket that had a client (deadlocks Lightroom)')
+    self.reconnects = self.reconnects + 1
+    self.listening = true
+end
+function FakeSocket:callback(name, ...)
+    self.params[name](self, ...)
+end
+function FakeSocket:close() self.closed = true; self.peer = false end
+
+-- Test-side controls ("the helper").
+function FakeSocket:startListening(port)
+    self.listening = true
+    self:callback('onConnecting', port)
+end
+function FakeSocket:helperConnects()
+    assert(self.listening, 'helper connected to a socket that is not listening')
+    self.listening = false
+    self.peer = true
+    self.hadPeer = true
+    self:callback('onConnected', self.port)
+end
+function FakeSocket:helperDisconnects()
+    self.peer = false
+    self:callback('onClosed')
+end
+function FakeSocket:timeout() self.listening = false; self:callback('onError', 'timeout') end
+
+local function newFakeSocket(params)
+    assert(params.functionContext, 'bind needs a function context')
+    assert(params.plugin, 'bind needs _PLUGIN')
+    -- Re-arming a "receive" LrSocket deadlocks LrC 15.6; the plug-in must not use one.
+    assert(params.mode == 'send', 'expected a send socket')
+    assert(params.port == 0, 'expected a system-chosen port')
+    local s = setmetatable({ params = params, mode = params.mode, sent = {}, reconnects = 0,
+                             port = 54321 + #sockets, listening = false, peer = false, closed = false }, FakeSocket)
+    sockets[#sockets + 1] = s
+    -- Replacement sockets start listening on their own (the first one is driven by
+    -- the startup test).
+    if #sockets > 1 then spawn(function() s:startListening(s.port) end) end
+    return s
+end
+
+---------------------------------------------------------------------------------
+-- Other SDK stubs
+---------------------------------------------------------------------------------
+
+local executed = {}           -- helper launches
+local executeStatus = 0
+helperRunning = false         -- what the plug-in's pgrep check sees
+processChecks = 0
 local observers = {}
-local helperTouchedAt = nil
 local currentModule = 'develop'
 local prefs = {}
 
@@ -72,26 +131,13 @@ end
 
 local target = newPhoto(1, 'A.CR3')
 
-local function fileExists(path)
-    local f = io.open(path, 'rb')
-    if f then f:close(); return true end
-    return false
-end
-
-local function isDir(path)
-    return os.execute('test -d "' .. path .. '"') == true
-end
-
-local function readFile(path)
-    local f = assert(io.open(path, 'rb'))
-    local s = f:read('a')
-    f:close()
-    return s
-end
-
 -- Lightroom's Lua sandbox has no os.rename / os.remove; neither may the plug-in.
-local realRename, realRemove = os.rename, os.remove
+local realExecute = os.execute
 os.rename, os.remove = nil, nil
+
+local function shq(s) return "'" .. s:gsub("'", "'\\''") .. "'" end
+local helperAppPath = home .. "/Plug ins/It's here/LRCScopes.lrplugin/bin/LRC Scopes.app"
+realExecute('mkdir -p ' .. shq(helperAppPath))
 
 local stubs = {
     LrApplication = { activeCatalog = function() return { getTargetPhoto = function() return target end } end },
@@ -105,50 +151,42 @@ local stubs = {
     },
     LrFunctionContext = { callWithContext = function(_, fn) return fn({}) end },
     LrPrefs = { prefsForPlugin = function() return prefs end },
+    LrSocket = { bind = newFakeSocket },
+    LrStringUtils = {
+        -- Real base64 is irrelevant here; wrap lines like some encoders do so the
+        -- newline stripping is exercised.
+        encodeBase64 = function(s)
+            local hex = s:gsub('.', function(c) return string.format('%02x', c:byte()) end)
+            return (hex:gsub(('.'):rep(8), '%0\r\n'))
+        end,
+    },
     LrTasks = {
         startAsyncTask = function(fn) spawn(fn) end,
         sleep = function(s) coroutine.yield(s) end,
         pcall = pcall,
-        execute = function(cmd) executed[#executed + 1] = cmd; return 0 end,
+        execute = function(cmd)
+            if cmd:find('pgrep', 1, true) then
+                processChecks = processChecks + 1
+                return helperRunning and 0 or 1
+            end
+            executed[#executed + 1] = cmd
+            return executeStatus
+        end,
     },
     LrPathUtils = {
         child = function(a, b) return a .. '/' .. b end,
-        getStandardFilePath = function(which) assert(which == 'home'); return home end,
         leafName = function(p) return p:match('([^/]+)$') end,
     },
     LrFileUtils = {
         exists = function(p)
-            if isDir(p) then return 'directory' end
-            return fileExists(p) and 'file' or false
-        end,
-        createAllDirectories = function(p) os.execute('mkdir -p "' .. p .. '"') end,
-        delete = function(p) return realRemove(p) ~= nil end,
-        -- Like Lightroom's: a rename that refuses to replace an existing file.
-        move = function(from, to)
-            if fileExists(to) then return false, 'destination exists' end
-            return realRename(from, to) ~= nil
-        end,
-        files = function(dir)
-            local pipe = io.popen('ls -1 "' .. dir .. '"')
-            local list = {}
-            for line in pipe:lines() do list[#list + 1] = dir .. '/' .. line end
-            pipe:close()
-            local i = 0
-            return function() i = i + 1; return list[i] end
-        end,
-        fileAttributes = function(p)
-            if p:match('helper%.json$') and helperTouchedAt then
-                return { fileModificationDate = helperTouchedAt }
-            end
-            return {}
+            if realExecute('test -d ' .. shq(p)) == true then return 'directory' end
+            return false
         end,
     },
     LrLogger = function()
         local l = {}
         local function noop() end
-        for _, m in ipairs({ 'enable', 'disable', 'infof', 'tracef', 'warnf', 'errorf' }) do
-            l[m] = noop
-        end
+        for _, m in ipairs({ 'enable', 'disable', 'infof', 'tracef', 'warnf' }) do l[m] = noop end
         l.errorf = function(_, fmt, ...) io.stderr:write('  [plug-in error] ', string.format(fmt, ...), '\n') end
         return l
     end,
@@ -163,7 +201,6 @@ end
 _G.MAC_ENV = true
 _G.WIN_ENV = false
 _G._PLUGIN = { path = home .. "/Plug ins/It's here/LRCScopes.lrplugin" }
-os.execute("mkdir -p '" .. home .. "/Plug ins/It'\\''s here/LRCScopes.lrplugin/bin/LRC Scopes.app'")
 
 ---------------------------------------------------------------------------------
 -- Tiny test framework
@@ -178,171 +215,286 @@ local function check(cond, message)
     end
 end
 
-local SessionFiles = require 'SessionFiles'
+local Protocol = require 'Protocol'
 local Service = require 'ScopesService'
 
-local function state()
-    local s = readFile(SessionFiles.path('state.json'))
-    return s
-end
+local function sock() return sockets[#sockets] end
 
-local function touchHelper() helperTouchedAt = clock end
-
-local function lastRequest()
-    return target.requests[#target.requests]
+-- The helper process. When it quits, the send-mode socket is NOT told (as in LrC).
+local helper = {}
+function helper.connect()
+    helperRunning = true
+    sock():helperConnects()
 end
+function helper.quit()
+    helperRunning = false
+    sock().peer = false
+end
+local function lastRequest() return target.requests[#target.requests] end
+local function sentOfType(t)
+    local out = {}
+    for _, so in ipairs(sockets) do
+        for _, m in ipairs(so.sent) do
+            if m:find('"type":"' .. t .. '"', 1, true) then out[#out + 1] = m end
+        end
+    end
+    return out
+end
+local function lastOfType(t) local l = sentOfType(t); return l[#l] end
+local function countFrames() return #sentOfType('frame') end
 
 ---------------------------------------------------------------------------------
--- JSON encoder
+-- Protocol encoding (the exact lines the Swift tests decode)
 ---------------------------------------------------------------------------------
 
 do
-    local enc = SessionFiles.encodeJSON
-    check(enc({ b = true, a = 1, c = 'x"y\n' }) == '{"a":1,"b":true,"c":"x\\"y\\n"}', 'object encoding: ' .. enc({ b = true, a = 1, c = 'x"y\n' }))
+    local enc = Protocol.encodeJSON
+    check(enc({ b = true, a = 1, c = 'x"y\n' }) == '{"a":1,"b":true,"c":"x\\"y\\n"}', 'object encoding')
     check(enc({ 1, 2, 3 }) == '[1,2,3]', 'array encoding')
-    check(enc({}) == '{}', 'empty table encodes as object')
-    check(enc(1.5) == '1.500000', 'float encoding')
     check(enc(0 / 0) == 'null', 'NaN encodes as null')
     check(enc('\1') == '"\\u0001"', 'control characters escaped')
     check(enc('Å.CR3') == '"Å.CR3"', 'UTF-8 passes through')
+
+    check(Protocol.hello('1.1.0') == '{"pluginVersion":"1.1.0","protocol":2,"type":"hello"}', 'hello line: ' .. Protocol.hello('1.1.0'))
+    check(Protocol.state(true, 'develop', 42, 'DSC_0001.NEF', 3) ==
+        '{"enabled":true,"module":"develop","photo":{"id":42,"name":"DSC_0001.NEF"},"showSeq":3,"type":"state"}', 'state line')
+    check(Protocol.state(false, 'library', nil, nil) == '{"enabled":false,"module":"library","type":"state"}', 'state without photo')
+    check(Protocol.quit() == '{"type":"quit"}', 'quit line')
+    local frame = Protocol.frame(7, 42, 'JPEGDATA-THAT-IS-LONG-ENOUGH-TO-WRAP', 12.4, 1000.5)
+    check(frame:match('^{"type":"frame","seq":7,"photoId":42,"renderMs":12,"sentAt":1000%.500,"jpeg":"[0-9a-f]+"}$') ~= nil,
+        'frame line is one line with unwrapped payload: ' .. frame)
 end
 
 ---------------------------------------------------------------------------------
--- Service lifecycle
+-- Startup: bind, then launch the helper with the port
 ---------------------------------------------------------------------------------
-
--- Leftovers from a "previous session" must be cleaned and must not make a new
--- helper quit.
-os.execute('mkdir -p "' .. SessionFiles.directory() .. '"')
-SessionFiles.atomicWrite(SessionFiles.path('frame-99.jpg'), 'old')
-SessionFiles.atomicWrite(SessionFiles.path('state.json'), '{"protocol":1,"heartbeat":0,"enabled":true,"quit":true}')
 
 Service.start()
 advance(0.01)
+check(#sockets == 1, 'one socket bound')
+check(#executed == 0, 'no launch before the socket has a port')
 
-check(not fileExists(SessionFiles.path('frame-99.jpg')), 'stale frames removed on start')
-check(state():find('"quit":false', 1, true), 'fresh state written before helper launch')
-check(#executed == 1, 'helper launched once on start')
+sock():startListening(54321)
+advance(0.3)
+check(#executed == 1, 'helper launched once the port is known')
 check(executed[1] and executed[1]:find("/Plug ins/It'\\''s here/LRCScopes.lrplugin/bin/LRC Scopes.app'", 1, true),
     'helper path shell-quoted: ' .. tostring(executed[1]))
-check(executed[1] and executed[1]:find('--session-dir', 1, true), 'session dir passed to helper')
-check(#observers == 1, 'adjustment observer registered in Develop')
+check(executed[1] and executed[1]:find('--port 54321', 1, true), 'port passed to helper: ' .. tostring(executed[1]))
+check(executed[1] and executed[1]:find('open -n -g', 1, true), 'fresh, background instance')
 
--- No helper yet: nothing rendered.
+-- No helper yet: nothing rendered; a listen timeout re-arms the socket.
 advance(1)
-check(#target.requests == 0, 'no preview requests while helper is not running')
+check(#target.requests == 0, 'no preview requests while the helper is not connected')
+sock():timeout()
+advance(0.3)
+check(sock().reconnects == 1, 'listen timeout re-arms the socket')
+check(processChecks == 0, 'no process checks while nothing is connected')
 
--- Helper comes up -> a frame is requested promptly.
-touchHelper()
-advance(1.2)
-check(#target.requests == 1, 'preview requested once helper is alive, got ' .. #target.requests)
-check(lastRequest().w == 1024, 'default preview size is 1024')
+---------------------------------------------------------------------------------
+-- Helper connects: hello, state, frame
+---------------------------------------------------------------------------------
+
+helper.connect()
+advance(0.3)
+check(sock().sent[1] == '{"pluginVersion":"1.1.0","protocol":2,"type":"hello"}\n', 'hello first, newline-terminated: ' .. tostring(sock().sent[1]))
+check(lastOfType('state') and lastOfType('state'):find('"module":"develop"', 1, true), 'state sent')
+check(lastOfType('state') and lastOfType('state'):find('"name":"A.CR3"', 1, true), 'photo name sent')
+check(#observers == 1, 'adjustment observer registered in Develop')
+check(#target.requests == 1, 'preview requested on connect, got ' .. #target.requests)
+check(lastRequest() and lastRequest().w == 1024, 'default preview size is 1024')
 
 lastRequest().cb('JPEG-1')
-check(fileExists(SessionFiles.path('frame-1.jpg')), 'frame-1 written')
-check(readFile(SessionFiles.path('frame-1.jpg')) == 'JPEG-1', 'frame content intact')
-check(state():find('"frame":{"file":"frame-1.jpg","photoId":1,"seq":1}', 1, true), 'state points to frame-1: ' .. state())
-check(state():find('"module":"develop"', 1, true), 'module reported')
-check(state():find('"name":"A.CR3"', 1, true), 'photo name reported')
-
--- A request repeated (settle) with identical pixels must not produce a frame.
-local function keepHelperAlive(seconds)
-    local stop = clock + seconds
-    while clock < stop do touchHelper(); advance(0.5) end
+check(countFrames() == 1, 'frame sent')
+check(lastOfType('frame') and lastOfType('frame'):find('"seq":1,"photoId":1', 1, true), 'frame header')
+for _, m in ipairs(sock().sent) do
+    check(m:sub(-1) == '\n' and not m:sub(1, -2):find('[\r\n]'), 'every message is exactly one line')
 end
-keepHelperAlive(1)
+
+-- Keepalive.
+local states = #sentOfType('state')
+advance(3)
+check(#sentOfType('state') >= states + 2, 'state re-sent as keepalive')
+
+-- Identical pixels from a settle request are not re-sent.
 for _, r in ipairs(target.requests) do if r ~= target.requests[1] then r.cb('JPEG-1') end end
-check(not fileExists(SessionFiles.path('frame-2.jpg')), 'identical preview not re-sent')
+check(countFrames() == 1, 'identical preview not re-sent')
 check(#target.requests >= 2, 'settle re-request issued after change')
 
--- Slider drag: observer fires continuously; requests are rate limited, one in flight.
+-- Slider drag: rate limited, one request in flight.
 local before = #target.requests
-for _ = 1, 20 do
-    observers[1].fn(observers[1].obs)
-    touchHelper()
-    advance(0.05)
-end
-local during = #target.requests - before
-check(during == 1, 'only one request in flight while dragging, got ' .. during)
+for _ = 1, 20 do observers[1].fn(observers[1].obs); advance(0.05) end
+check(#target.requests - before == 1, 'only one request in flight while dragging, got ' .. (#target.requests - before))
 lastRequest().cb('JPEG-2')
-check(fileExists(SessionFiles.path('frame-2.jpg')), 'new rendering produces frame-2')
-for _ = 1, 4 do observers[1].fn(observers[1].obs); lastRequest().cb('JPEG-x' .. clock); touchHelper(); advance(0.13) end
-check(not fileExists(SessionFiles.path('frame-1.jpg')), 'old frames pruned')
+check(countFrames() == 2, 'new rendering sent')
 
 -- Edits made outside the observer (e.g. sync) are found by the edit poll.
-keepHelperAlive(6) -- let settles drain
+advance(6)
 local n = #target.requests
 target.editCount = target.editCount + 1
-keepHelperAlive(1)
+advance(1)
 check(#target.requests > n, 'editCount change triggers a request')
 
 -- Late callback for a previous photo is ignored after switching photos.
 local oldRequest = lastRequest()
 target = newPhoto(2, 'B.NEF')
-keepHelperAlive(0.5)
-local frameBefore = state():match('"seq":(%d+)')
+advance(0.5)
+local framesBefore = countFrames()
 oldRequest.cb('LATE-FROM-A')
-check(state():match('"seq":(%d+)') == frameBefore, 'stale photo callback ignored')
+check(countFrames() == framesBefore, 'stale photo callback ignored')
 check(#target.requests == 1, 'new photo requested immediately')
 target.requests[1].cb('JPEG-B')
-check(state():find('"photoId":2', 1, true), 'frame for new photo published')
+check(lastOfType('frame'):find('"photoId":2', 1, true), 'frame for new photo sent')
 
--- Timeout: a request whose callback never arrives does not block forever.
-keepHelperAlive(6)
-n = #target.requests
-target.editCount = target.editCount + 1
-keepHelperAlive(8)
-check(#target.requests >= n + 2, 'requests resume after a lost callback')
-
--- Leaving Develop stops rendering.
-currentModule = 'library'
-keepHelperAlive(1)
-n = #target.requests
-target.editCount = target.editCount + 1
-keepHelperAlive(3)
-check(#target.requests == n, 'no requests outside Develop')
-check(state():find('"module":"library"', 1, true), 'module change published')
-currentModule = 'develop'
-
--- Helper gone -> rendering stops.
+-- A request whose callback never arrives does not block forever.
 advance(6)
 n = #target.requests
 target.editCount = target.editCount + 1
-advance(3)
-check(#target.requests == n, 'no requests when helper heartbeat is stale')
+advance(8)
+check(#target.requests >= n + 2, 'requests resume after a lost callback')
 
--- Hide / show.
-touchHelper()
-Service.hide()
-check(state():find('"enabled":false', 1, true), 'hide publishes enabled=false')
-check(prefs.enabled == false, 'hide persisted')
-keepHelperAlive(2)
+-- Leaving Develop stops rendering but keeps state flowing.
+currentModule = 'library'
+advance(1)
 n = #target.requests
 target.editCount = target.editCount + 1
-keepHelperAlive(2)
-check(#target.requests == n, 'no requests while hidden')
-spawn(function() Service.show() end)
-keepHelperAlive(1)
-check(prefs.enabled == true, 'show persisted')
-check(#target.requests > n, 'show resumes rendering')
+advance(3)
+check(#target.requests == n, 'no requests outside Develop')
+check(lastOfType('state'):find('"module":"library"', 1, true), 'module change sent')
+currentModule = 'develop'
+advance(1)
 
--- Show while helper is not running relaunches it.
-local launches = #executed
-advance(6) -- helper heartbeat goes stale
+---------------------------------------------------------------------------------
+-- Helper goes away: rendering stops, socket re-armed, relaunch on Show
+---------------------------------------------------------------------------------
+
+-- The failure that broke reopening: the helper quits but the send-mode socket never
+-- reports onClosed. The periodic process check must catch it.
+local checks = processChecks
+helper.quit()
+local oldSock, socketCount = sock(), #sockets
+local oldReconnects = oldSock.reconnects
+advance(2.5)
+check(processChecks > checks, 'helper process checked periodically while connected')
+check(not Service.worker.link.connected, 'missing helper process drops the link')
+check(#sockets == socketCount + 1, 'a fresh socket is bound for the next helper')
+check(oldSock.reconnects == oldReconnects and not oldSock.closed, 'the old socket is not touched')
+oldSock.params.onClosed(oldSock) -- a late callback from the abandoned socket
+advance(0.3)
+check(#sockets == socketCount + 1, 'callbacks from an abandoned socket are ignored')
+n = #target.requests
+target.editCount = target.editCount + 1
+advance(3)
+check(#target.requests == n, 'no requests while the helper is disconnected')
+check(#executed == 1, 'closing the panel does not relaunch the helper by itself')
+
 spawn(function() Service.show() end)
-advance(0.1)
-check(#executed == launches + 1, 'show relaunches a missing helper')
+advance(0.3)
+check(#executed == 2, 'Show Scopes relaunches the helper')
+check(executed[2]:find('--port ' .. sock().port, 1, true), 'relaunched helper gets the new port: ' .. executed[2])
 advance(20)
-check(#executed == launches + 2, 'one bounded retry if the helper does not come up, got ' .. (#executed - launches))
+check(#executed == 3, 'one bounded retry when the helper never connects, got ' .. #executed)
 
--- Shutdown tells the helper to quit and stops the loop.
+-- Reconnect: a fresh hello and a full frame even if pixels are unchanged.
+helper.connect()
+advance(0.3)
+check(#sentOfType('hello') == 2, 'hello on every connection')
+lastRequest().cb('JPEG-B')
+check(lastOfType('frame'):find('"photoId":2', 1, true) and countFrames() >= 4, 'reconnected helper gets a frame even if unchanged')
+
+---------------------------------------------------------------------------------
+-- Hide / show
+---------------------------------------------------------------------------------
+
+Service.hide()
+check(lastOfType('state'):find('"enabled":false', 1, true), 'hide sends enabled=false immediately')
+check(prefs.enabled == false, 'hide persisted')
+advance(2)
+n = #target.requests
+target.editCount = target.editCount + 1
+advance(2)
+check(#target.requests == n, 'no requests while hidden')
+local seqBefore = tonumber(lastOfType('state'):match('"showSeq":(%d+)'))
+spawn(function() Service.show() end)
+advance(1)
+check(prefs.enabled == true, 'show persisted')
+check(tonumber(lastOfType('state'):match('"showSeq":(%d+)')) == seqBefore + 1,
+    'Show Scopes bumps showSeq so a helper whose panel was closed re-opens it')
+check(#target.requests > n, 'show resumes rendering')
+check(#executed == 3, 'show does not relaunch a connected helper')
+
+---------------------------------------------------------------------------------
+-- Helper dies (crash, force quit) and Show Scopes comes before the periodic check
+---------------------------------------------------------------------------------
+
+check(processChecks - checks < 10, 'process checks are not excessive')
+advance(0.1)
+socketCount = #sockets
+helper.quit()
+spawn(function() Service.show() end)
+advance(0.05)
+check(#sockets == socketCount + 1, 'Show Scopes checks the process and binds a fresh socket')
+check(#executed == 4, 'and relaunches once the new port is known, got ' .. #executed)
+helper.connect()
+advance(0.3)
+check(Service.worker.link.connected, 'relaunched helper connects')
+
+-- An onClosed from the socket is also a disconnect.
+sock():helperDisconnects()
+helperRunning = false
+advance(0.3)
+check(not Service.worker.link.connected, 'socket close drops the link')
+spawn(function() Service.show() end)
+advance(0.3)
+helper.connect()
+advance(0.3)
+
+---------------------------------------------------------------------------------
+-- Preview errors: reported only while the helper has nothing for the photo
+---------------------------------------------------------------------------------
+
+target = newPhoto(3, 'C.3FR')
+advance(0.5)
+lastRequest().cb(nil, 'error loading thumb')
+check(lastOfType('previewError') == '{"photoId":3,"reason":"error loading thumb","type":"previewError"}\n',
+    'previewError sent: ' .. tostring(lastOfType('previewError')))
+local errors = #sentOfType('previewError')
+advance(1)
+lastRequest().cb('JPEG-C')
+advance(6)
+target.editCount = target.editCount + 1
+advance(0.5)
+lastRequest().cb(nil, 'error loading thumb')
+check(#sentOfType('previewError') == errors, 'no previewError once a frame was shown')
+
+---------------------------------------------------------------------------------
+-- Launch failure is reported to the caller
+---------------------------------------------------------------------------------
+
+helper.quit()
+advance(2.5)
+executeStatus = 1
+local showOk, showReason
+spawn(function() showOk, showReason = Service.show() end)
+advance(0.1)
+check(showOk == false and showReason and showReason:find('could not be started', 1, true), 'launch failure surfaces to Show Scopes')
+executeStatus = 0
+
+---------------------------------------------------------------------------------
+-- Shutdown
+---------------------------------------------------------------------------------
+
+helper.connect()
+advance(0.3)
 Service.shutdown()
-check(state():find('"quit":true', 1, true), 'shutdown publishes quit=true')
+check(sock().sent[#sock().sent] == '{"type":"quit"}\n', 'shutdown sends quit')
+check(sock().closed, 'socket closed on shutdown')
 advance(2)
 local alive = 0
-for _, t in ipairs(tasks) do if coroutine.status(t.co) ~= 'dead' then alive = alive + 1 end end
+for _, t in ipairs(tasks) do
+    if coroutine.status(t.co) ~= 'dead' then alive = alive + 1 end
+end
 check(alive == 0, 'service task exits after shutdown')
 
-os.execute('rm -rf "' .. home .. '"')
+realExecute('rm -rf ' .. shq(home))
 print(string.format('%d passed, %d failed', passes, failures))
 os.exit(failures == 0 and 0 or 1)

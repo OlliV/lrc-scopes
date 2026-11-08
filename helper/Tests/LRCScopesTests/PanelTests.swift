@@ -92,6 +92,20 @@ final class PanelTests: XCTestCase {
         }
     }
 
+    func testCloseButtonOnlyHidesThePanel() throws {
+        var closed = 0
+        controller.onUserClosed = { closed += 1 }
+        let window = try XCTUnwrap(controller.window)
+        controller.show(true)
+        window.performClose(nil)
+        XCTAssertEqual(closed, 1, "owner is told")
+        XCTAssertTrue(window.isVisible, "the panel itself decides nothing; the owner hides it")
+        controller.show(false)
+        XCTAssertFalse(window.isVisible)
+        controller.show(true)
+        XCTAssertTrue(window.isVisible, "can be shown again after a close")
+    }
+
     func testFrameMath() {
         let bounds = NSRect(x: 0, y: 0, width: 1000, height: 330)
         let f = ScopesContentView.frames(in: bounds, toolbarHeight: 30, layout: .both)

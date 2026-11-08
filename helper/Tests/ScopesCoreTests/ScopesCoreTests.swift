@@ -184,38 +184,80 @@ final class DecoderTests: XCTestCase {
     }
 }
 
-final class SessionProtocolTests: XCTestCase {
-    // Mirrors exactly what SessionFiles.lua emits (key order and number formatting).
-    let sample = """
-    {"protocol":1,"pluginVersion":"1.0.0","heartbeat":784249200.25,"enabled":true,"quit":false,\
-    "module":"develop","photo":{"id":42,"name":"DSC_0001.NEF"},\
-    "frame":{"seq":7,"file":"frame-7.jpg","photoId":42}}
-    """
+final class WireProtocolTests: XCTestCase {
+    // These lines are byte-for-byte what Protocol.lua emits (see plugin/tests).
+    func testDecodesHello() throws {
+        let m = try PluginMessage.decode(line: Data(#"{"pluginVersion":"1.1.0","protocol":2,"type":"hello"}"#.utf8))
+        XCTAssertEqual(m, .hello(protocol: 2, pluginVersion: "1.1.0"))
+    }
 
-    func testDecodesPluginState() throws {
-        let s = try PluginState.decode(Data(sample.utf8))
-        XCTAssertEqual(s.protocol, 1)
+    func testDecodesState() throws {
+        let line = #"{"enabled":true,"module":"develop","photo":{"id":42,"name":"DSC_0001.NEF"},"type":"state"}"#
+        guard case .state(let s) = try PluginMessage.decode(line: Data(line.utf8)) else { return XCTFail() }
         XCTAssertTrue(s.enabled)
         XCTAssertTrue(s.isInDevelop)
-        XCTAssertEqual(s.photo?.name, "DSC_0001.NEF")
-        XCTAssertEqual(s.frame?.seq, 7)
-        XCTAssertEqual(s.frame?.photoId, 42)
-        XCTAssertTrue(s.isFresh(now: 784249203))
-        XCTAssertFalse(s.isFresh(now: 784249300))
+        XCTAssertEqual(s.photo, .init(id: 42, name: "DSC_0001.NEF"))
     }
 
-    func testOptionalFieldsMayBeAbsent() throws {
-        let s = try PluginState.decode(Data(#"{"protocol":1,"heartbeat":1,"enabled":false}"#.utf8))
-        XCTAssertNil(s.frame)
+    func testStateWithoutPhoto() throws {
+        guard case .state(let s) = try PluginMessage.decode(line: Data(#"{"enabled":false,"module":"library","type":"state"}"#.utf8)) else { return XCTFail() }
         XCTAssertNil(s.photo)
         XCTAssertFalse(s.isInDevelop)
+        XCTAssertNil(s.showSeq, "older plug-ins don't send showSeq")
     }
 
-    func testFrameFileNameValidation() {
-        XCTAssertTrue(PluginState.isSafeFrameFileName("frame-12.jpg"))
-        XCTAssertFalse(PluginState.isSafeFrameFileName("../etc/passwd.jpg"))
-        XCTAssertFalse(PluginState.isSafeFrameFileName(".hidden.jpg"))
-        XCTAssertFalse(PluginState.isSafeFrameFileName("frame-1.png"))
+    func testStateWithShowSeq() throws {
+        // Exactly what Protocol.lua sends (sorted keys).
+        let line = #"{"enabled":true,"module":"develop","photo":{"id":1,"name":"A.CR3"},"showSeq":3,"type":"state"}"#
+        guard case .state(let s) = try PluginMessage.decode(line: Data(line.utf8)) else { return XCTFail() }
+        XCTAssertEqual(s.showSeq, 3)
+    }
+
+    func testDecodesFrameWithBase64Payload() throws {
+        let jpeg = Data([0xFF, 0xD8, 0xFF, 0x00, 0x10, 0xFF, 0xD9])
+        let line = #"{"type":"frame","seq":7,"photoId":42,"renderMs":85,"sentAt":784249200.250,"jpeg":""# + jpeg.base64EncodedString() + #""}"#
+        XCTAssertEqual(try PluginMessage.decode(line: Data(line.utf8)),
+                       .frame(FrameMessage(seq: 7, photoId: 42, jpeg: jpeg, renderMs: 85, sentAt: 784249200.25)))
+        // Diagnostics are optional.
+        let bare = #"{"type":"frame","seq":1,"photoId":2,"jpeg":""# + jpeg.base64EncodedString() + #""}"#
+        XCTAssertEqual(try PluginMessage.decode(line: Data(bare.utf8)), .frame(FrameMessage(seq: 1, photoId: 2, jpeg: jpeg)))
+    }
+
+    func testDecodesPreviewError() throws {
+        let line = #"{"photoId":1,"reason":"error loading thumb","type":"previewError"}"#
+        XCTAssertEqual(try PluginMessage.decode(line: Data(line.utf8)), .previewError(photoId: 1, reason: "error loading thumb"))
+    }
+
+    func testQuitAndUnknownTypes() throws {
+        XCTAssertEqual(try PluginMessage.decode(line: Data(#"{"type":"quit"}"#.utf8)), .quit)
+        XCTAssertThrowsError(try PluginMessage.decode(line: Data(#"{"type":"bogus"}"#.utf8)))
+        XCTAssertThrowsError(try PluginMessage.decode(line: Data("not json".utf8)))
+    }
+
+    func testFramerSplitsAcrossChunksAndIgnoresBlankLines() throws {
+        var f = LineFramer()
+        XCTAssertEqual(try f.append(Data("abc".utf8)), [])
+        XCTAssertEqual(try f.append(Data("def\n\ngh".utf8)), [Data("abcdef".utf8)])
+        XCTAssertEqual(try f.append(Data("i\r\nj\n".utf8)), [Data("ghi".utf8), Data("j".utf8)])
+        XCTAssertEqual(try f.append(Data()), [])
+    }
+
+    func testFramerRejectsRunawayLines() {
+        var f = LineFramer(maxLineLength: 8)
+        XCTAssertThrowsError(try f.append(Data("0123456789".utf8)))
+        XCTAssertEqual(try f.append(Data("ok\n".utf8)), [Data("ok".utf8)], "framer recovers after reset")
+    }
+
+    func testLargeFrameRoundTrip() throws {
+        let jpeg = Data((0..<400_000).map { UInt8($0 % 251) })
+        let line = Data((#"{"type":"frame","seq":1,"photoId":1,"jpeg":""# + jpeg.base64EncodedString() + "\"}\n").utf8)
+        var f = LineFramer()
+        var lines: [Data] = []
+        for chunk in stride(from: 0, to: line.count, by: 65_536) {
+            lines += try f.append(line.subdata(in: chunk..<min(line.count, chunk + 65_536)))
+        }
+        XCTAssertEqual(lines.count, 1)
+        XCTAssertEqual(try PluginMessage.decode(line: lines[0]), .frame(FrameMessage(seq: 1, photoId: 1, jpeg: jpeg)))
     }
 }
 
