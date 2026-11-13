@@ -39,16 +39,32 @@ end)()
 local TICK_ACTIVE = 0.05          -- loop period while scopes are live
 local TICK_IDLE = 0.25            -- loop period otherwise (still services the socket)
 local MIN_REQUEST_INTERVAL = 0.12 -- caps preview requests at ~8/s while dragging sliders
+-- A preview that has to be rendered from the raw costs Lightroom real work. After
+-- each one, wait RENDER_IDLE_FACTOR times as long as it took before asking again, so
+-- the scopes take at most 1 / (1 + factor) of Lightroom's rendering time.
+local RENDER_IDLE_FACTOR = 2
+local MAX_RENDER_IDLE = 1.5       -- but never wait longer than this
+local RENDER_STATS_INTERVAL = 30  -- log render-time statistics this often while active
 local SETTLE_DELAYS = { 0.5, 1.5, 4.0 } -- re-requests after the last change
+-- After a failed request ("error loading thumb"): Lightroom can take many seconds to
+-- have a preview of a large raw again after an edit (observed with Hasselblad .3FR),
+-- far beyond the settle delays. Keep retrying with backoff for this long.
+local RETRY_DELAYS = { 0.5, 1, 2 } -- then the last value repeats
+local RETRY_WINDOW = 30
 local REQUEST_TIMEOUT = 6         -- give up on a request whose callback never arrives
 local HANDLE_RETENTION = 20       -- keep request objects alive for late repeat callbacks
 local EDIT_POLL_INTERVAL = 0.4
 local KEEPALIVE_INTERVAL = 1      -- must be < WireProtocol.staleAfter in the helper
--- (Helper liveness in the other direction: HelperLink.PROCESS_CHECK_INTERVAL.)
+-- (Helper liveness in the other direction: HelperLink:verify() on Show Scopes.)
 local HELPER_LAUNCH_GRACE = 8     -- wait this long for a launched helper to connect
 local HELPER_LAUNCH_ATTEMPTS = 2
+local SHOW_PORT_WAIT = 2          -- Show Scopes waits this long for a new socket's port
 
 local DEFAULT_PREVIEW_SIZE = 1024
+-- When requests at the chosen size fail, step down through these. Lightroom keeps the
+-- small (filmstrip-size) thumbnail of the photo being developed current while the
+-- larger cached preview levels may only be refreshed when you leave the photo.
+local FALLBACK_SIZES = { 640, 320 }
 
 local Service = {
     running = false,
@@ -81,11 +97,18 @@ local function newWorker(generation, context)
         dirty = false,
         settleAt = {},
         lastRequestAt = 0,
+        notBefore = 0,          -- earliest time for the next request (render throttle)
+        renderStats = { count = 0, total = 0, max = 0, since = nil },
         inflight = nil,
         handles = {},
 
         seq = 0,
         lastJpeg = nil,
+        editGen = 0,            -- bumped by every change that needs a new preview
+        updating = false,       -- the helper's frame doesn't reflect editGen yet
+        failures = nil,         -- { count, since, gaveUp } while requests keep failing
+        sizeStep = 0,           -- 0 = preferred size, n = FALLBACK_SIZES[n] (per photo)
+        smallSizeLogged = false,
 
         launchWanted = false,   -- launch as soon as the socket has a port
         launchRequestedAt = nil,
@@ -97,10 +120,21 @@ local function newWorker(generation, context)
     }, Worker)
 end
 
+function Worker:setUpdating(updating)
+    if self.updating ~= updating then
+        self.updating = updating
+        self.stateChanged = true
+    end
+end
+
 function Worker:markDirty(now)
+    self.editGen = self.editGen + 1
+    self:setUpdating(true)
     self.dirty = true
     self.settleAt = {}
     for i, delay in ipairs(SETTLE_DELAYS) do self.settleAt[i] = now + delay end
+    -- A new edit restarts the retry window of a failure streak.
+    if self.failures then self.failures.since, self.failures.gaveUp = now, false end
 end
 
 function Worker:helperConnected()
@@ -112,7 +146,7 @@ function Worker:isActive()
 end
 
 function Worker:sendState(now)
-    if self.link:send(Protocol.state(self.enabled, self.module, self.photoId, self.photoName)) then
+    if self.link:send(Protocol.state(self.enabled, self.module, self.photoId, self.photoName, self.updating)) then
         self.lastStateSent = now
         self.stateChanged = false
     end
@@ -208,9 +242,13 @@ function Worker:trackTarget(now)
         self.photoName = photo and photo:getFormattedMetadata('fileName') or nil
         self.editStamp = photo and editStampOf(photo) or nil
         self.lastJpeg = nil
+        self.failures = nil
+        self.sizeStep = 0
+        self.smallSizeLogged = false
         -- Don't wait for a request about the previous photo; its result is ignored.
         self.inflight = nil
         self.lastRequestAt = 0
+        self.notBefore = 0
         self.stateChanged = true
         Log.trace('Target photo: %s', tostring(self.photoName))
         if photo then self:markDirty(now) end
@@ -234,18 +272,22 @@ function Worker:pruneHandles(now)
 end
 
 function Worker:onThumbnail(request, jpeg, err)
-    if self.inflight == request then self.inflight = nil end
+    if self.inflight == request then
+        self.inflight = nil
+        self:noteRenderTime(request)
+    end
     if Service.worker ~= self then return end -- service restarted meanwhile
     if request.photoId ~= self.photoId then return end -- user moved on
     if not jpeg then
-        Log.warn('Preview request failed for %s: %s', tostring(self.photoName), tostring(err))
-        -- Only tell the helper if it has nothing for this photo yet; otherwise the last
-        -- good frame stays up. Settle re-requests keep retrying meanwhile.
-        if self.lastJpeg == nil then
-            self.link:send(Protocol.previewError(request.photoId, tostring(err or 'unknown error')))
-        end
+        self:onPreviewFailed(request, err)
         return
     end
+    self:onPreviewAvailable()
+    if request.size < self:sizeForStep(0) and not self.smallSizeLogged then
+        self.smallSizeLogged = true
+        Log.info('Preview of %s works at %d px', tostring(self.photoName), request.size)
+    end
+    if request.gen == self.editGen then self:setUpdating(false) end
     if jpeg == self.lastJpeg then return end         -- identical rendering, nothing new
 
     local seq = self.seq + 1
@@ -259,9 +301,86 @@ function Worker:onThumbnail(request, jpeg, err)
     end
 end
 
+--- Throttles the next request by how long this one took, and logs statistics.
+function Worker:noteRenderTime(request)
+    local now = LrDate.currentTime()
+    local took = now - request.startedAt
+    self.notBefore = math.max(self.notBefore, now + math.min(MAX_RENDER_IDLE, RENDER_IDLE_FACTOR * took))
+    local st = self.renderStats
+    st.since = st.since or now
+    st.count, st.total, st.max = st.count + 1, st.total + took, math.max(st.max, took)
+    if now - st.since >= RENDER_STATS_INTERVAL then
+        Log.info('Previews: %d in %.0f s, average %.0f ms, max %.0f ms (%d px)', st.count, now - st.since,
+            st.total / st.count * 1000, st.max * 1000, request.size or 0)
+        self.renderStats = { count = 0, total = 0, max = 0, since = nil }
+    end
+end
+
+--- A request failed. Keeps the last good frame up (or tells the helper there is none)
+--- and schedules a retry; one log line per failure streak, not per request.
+function Worker:onPreviewFailed(request, err)
+    local now = LrDate.currentTime()
+    -- Step down a size, once per failing size.
+    local nextSize = self:sizeForStep(self.sizeStep + 1)
+    if request.size == self:requestSize() and nextSize then
+        Log.info('Preview of %s failed at %d px; trying %d px', tostring(self.photoName), request.size, nextSize)
+        self.sizeStep = self.sizeStep + 1
+        self.dirty = true -- retry at the smaller size right away
+    end
+    local f = self.failures
+    if not f then
+        f = { count = 0, since = now, err = tostring(err or 'unknown error') }
+        self.failures = f
+        Log.info('Lightroom has no preview of %s (%s); retrying', tostring(self.photoName), f.err)
+    end
+    f.count = f.count + 1
+    Log.trace('Preview request %d failed for %s: %s', f.count, tostring(self.photoName), tostring(err))
+    if self.lastJpeg == nil then
+        self.link:send(Protocol.previewError(request.photoId, f.err))
+    end
+    if f.gaveUp then return end
+    if now - f.since > RETRY_WINDOW then
+        f.gaveUp = true
+        self:setUpdating(false)
+        Log.warn('No preview of %s for %d s (%d requests); waiting for the next edit',
+            tostring(self.photoName), RETRY_WINDOW, f.count)
+        return
+    end
+    -- One retry pending at a time: a request can report failure more than once, and
+    -- pending settle requests already count as retries.
+    if #self.settleAt > 0 then return end
+    self.settleAt[1] = now + RETRY_DELAYS[math.min(f.count, #RETRY_DELAYS)]
+end
+
+function Worker:onPreviewAvailable()
+    local f = self.failures
+    if not f then return end
+    self.failures = nil
+    Log.info('Preview of %s available again after %.1f s (%d failed requests)',
+        tostring(self.photoName), LrDate.currentTime() - f.since, f.count)
+end
+
+--- Size for a fallback step: 0 is the preferred size; nil when there is no smaller one.
+function Worker:sizeForStep(step)
+    local preferred = tonumber(LrPrefs.prefsForPlugin().previewSize) or DEFAULT_PREVIEW_SIZE
+    if step == 0 then return preferred end
+    local n = 0
+    for _, size in ipairs(FALLBACK_SIZES) do
+        if size < preferred then
+            n = n + 1
+            if n == step then return size end
+        end
+    end
+    return nil
+end
+
+function Worker:requestSize()
+    return self:sizeForStep(self.sizeStep) or self:sizeForStep(0)
+end
+
 function Worker:requestFrame(now)
-    local size = tonumber(LrPrefs.prefsForPlugin().previewSize) or DEFAULT_PREVIEW_SIZE
-    local request = { photoId = self.photoId, startedAt = now }
+    local size = self:requestSize()
+    local request = { photoId = self.photoId, startedAt = now, size = size, gen = self.editGen }
     self.inflight = request
     self.lastRequestAt = now
     local worker = self
@@ -278,7 +397,7 @@ function Worker:scheduleRequests(now)
         Log.warn('Preview request timed out for %s', tostring(self.photoName))
         self.inflight = nil
     end
-    if self.inflight or now - self.lastRequestAt < MIN_REQUEST_INTERVAL then return end
+    if self.inflight or now - self.lastRequestAt < MIN_REQUEST_INTERVAL or now < self.notBefore then return end
 
     if self.dirty then
         self.dirty = false
@@ -376,15 +495,17 @@ function Service.show()
     worker.enabled = true
     worker.stateChanged = true
     worker:markDirty(LrDate.currentTime())
-    -- The user may have just closed the helper; don't wait for the periodic check.
+    -- The helper may have died (the socket doesn't say so); check before deciding.
     if worker:helperConnected() then worker.link:verify() end
     if not worker:helperConnected() then
         worker:requestLaunch()
-        -- Launch happens on the service task; surface an immediate failure here.
-        if worker.link.port then
-            worker:manageHelper(LrDate.currentTime())
-            if worker.launchError then return false, worker.launchError end
-        end
+        -- After a lost helper the link binds a new socket; give it a moment to get a
+        -- port so a launch failure can be reported here rather than only logged.
+        local waitUntil = LrDate.currentTime() + SHOW_PORT_WAIT
+        while not worker.link.port and LrDate.currentTime() < waitUntil do LrTasks.sleep(0.05) end
+        -- The service task may have launched meanwhile; either way launchError says.
+        if worker.link.port and worker.launchWanted then worker:manageHelper(LrDate.currentTime()) end
+        if worker.launchError then return false, worker.launchError end
     end
     return true
 end

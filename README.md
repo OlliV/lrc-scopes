@@ -46,10 +46,11 @@ Lightroom Classic                                LRC Scopes.app (bundled in the 
 * **Helper lifetime.** In LrC 15.6, calling `reconnect()` on an LrSocket whose client
   has gone away deadlocks Lightroom's main thread (send and receive mode alike). So
   the helper runs for the whole Lightroom session: its panel has no close button, only
-  Show / Hide Scopes in Lightroom. If the helper dies anyway (crash,
-  force quit), the plug-in notices within 2 s by checking for its process (a send
-  socket doesn't report its client leaving), abandons that socket untouched and binds
-  a fresh one for the next helper.
+  Show / Hide Scopes in Lightroom. If the helper dies anyway (crash, force quit),
+  Show Scopes notices by checking for its process (a send socket doesn't report its
+  client leaving), abandons that socket untouched, binds a fresh one and relaunches
+  the helper. The check is deliberately not periodic: running a shell command every
+  few seconds coincided with Lightroom failing preview requests after edits.
 * **Scopes.** Computed from gamma-encoded R′G′B′ (as broadcast scopes and Resolve do).
   Waveform: 10-bit (0–1023) graticule, RGB overlay / parade / luma (Rec.709 Y′).
   Vectorscope: Rec.709 Cb/Cr, 75% target boxes, 100% target marks, skin tone line,

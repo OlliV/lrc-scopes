@@ -15,7 +15,7 @@ import Foundation
 /// ignored. Messages (see `PluginMessage`):
 ///
 ///   {"type":"hello","protocol":2,"pluginVersion":"1.1.0"}
-///   {"type":"state","enabled":true,"module":"develop","photo":{"id":1,"name":"A.CR3"}}
+///   {"type":"state","enabled":true,"module":"develop","photo":{"id":1,"name":"A.CR3"},"updating":true}
 ///   {"type":"frame","seq":7,"photoId":1,"renderMs":85,"sentAt":784249200.250,"jpeg":"<base64>"}
 ///   {"photoId":1,"reason":"error loading thumb","type":"previewError"}
 ///   {"type":"quit"}
@@ -42,11 +42,15 @@ public struct PluginState: Codable, Equatable {
     /// Lightroom module name as returned by `LrApplicationView.getCurrentModuleName()`.
     public var module: String?
     public var photo: Photo?
+    /// An edit (or photo change) is not reflected in the last frame yet: Lightroom is
+    /// still rendering, or the plug-in is pacing its requests. Absent means false.
+    public var updating: Bool?
 
-    public init(enabled: Bool, module: String?, photo: Photo?) {
+    public init(enabled: Bool, module: String?, photo: Photo?, updating: Bool? = nil) {
         self.enabled = enabled
         self.module = module
         self.photo = photo
+        self.updating = updating
     }
 
     public var isInDevelop: Bool { module == "develop" }

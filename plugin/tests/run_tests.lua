@@ -53,7 +53,8 @@ FakeSocket.__index = FakeSocket
 
 function FakeSocket:send(message)
     assert(self.mode == 'send', 'send on a non-send socket')
-    assert(self.peer, 'send while no client is connected')
+    -- Like LrC: sending to a client that has gone away raises nothing.
+    if not self.peer then self.dropped = (self.dropped or 0) + 1; return end
     self.sent[#self.sent + 1] = message
 end
 function FakeSocket:reconnect()
@@ -216,6 +217,15 @@ local function check(cond, message)
 end
 
 local Protocol = require 'Protocol'
+local MAX_IDLE = 1.6 -- > ScopesService MAX_RENDER_IDLE
+-- Let pending settle requests run, answer them, and wait out the render throttle.
+local function quiesce(jpeg)
+    for _ = 1, 12 do
+        advance(0.8)
+        for _, r in ipairs(target.requests) do if not r.done then r.done = true; r.cb(jpeg) end end
+    end
+    advance(MAX_IDLE)
+end
 local Service = require 'ScopesService'
 
 local function sock() return sockets[#sockets] end
@@ -259,6 +269,8 @@ do
     check(Protocol.state(true, 'develop', 42, 'DSC_0001.NEF') ==
         '{"enabled":true,"module":"develop","photo":{"id":42,"name":"DSC_0001.NEF"},"type":"state"}', 'state line')
     check(Protocol.state(false, 'library', nil, nil) == '{"enabled":false,"module":"library","type":"state"}', 'state without photo')
+    check(Protocol.state(true, 'develop', 1, 'A.CR3', true) ==
+        '{"enabled":true,"module":"develop","photo":{"id":1,"name":"A.CR3"},"type":"state","updating":true}', 'state while updating')
     check(Protocol.quit() == '{"type":"quit"}', 'quit line')
     local frame = Protocol.frame(7, 42, 'JPEGDATA-THAT-IS-LONG-ENOUGH-TO-WRAP', 12.4, 1000.5)
     check(frame:match('^{"type":"frame","seq":7,"photoId":42,"renderMs":12,"sentAt":1000%.500,"jpeg":"[0-9a-f]+"}$') ~= nil,
@@ -320,7 +332,9 @@ for _, r in ipairs(target.requests) do if r ~= target.requests[1] then r.cb('JPE
 check(countFrames() == 1, 'identical preview not re-sent')
 check(#target.requests >= 2, 'settle re-request issued after change')
 
--- Slider drag: rate limited, one request in flight.
+-- Slider drag: rate limited, one request in flight. (Wait out the render throttle
+-- from the late answers above first.)
+quiesce('JPEG-1')
 local before = #target.requests
 for _ = 1, 20 do observers[1].fn(observers[1].obs); advance(0.05) end
 check(#target.requests - before == 1, 'only one request in flight while dragging, got ' .. (#target.requests - before))
@@ -328,7 +342,7 @@ lastRequest().cb('JPEG-2')
 check(countFrames() == 2, 'new rendering sent')
 
 -- Edits made outside the observer (e.g. sync) are found by the edit poll.
-advance(6)
+quiesce('JPEG-2')
 local n = #target.requests
 target.editCount = target.editCount + 1
 advance(1)
@@ -367,29 +381,30 @@ advance(1)
 -- Helper goes away: rendering stops, socket re-armed, relaunch on Show
 ---------------------------------------------------------------------------------
 
--- The failure that broke reopening: the helper quits but the send-mode socket never
--- reports onClosed. The periodic process check must catch it.
+-- The helper dies (crash, force quit) and the send-mode socket never reports
+-- onClosed. Nothing polls for that (a periodic shell command coincided with preview
+-- requests failing); Show Scopes checks the process before deciding.
 local checks = processChecks
 helper.quit()
 local oldSock, socketCount = sock(), #sockets
 local oldReconnects = oldSock.reconnects
-advance(2.5)
-check(processChecks > checks, 'helper process checked periodically while connected')
+advance(10)
+check(processChecks == checks, 'no periodic process checks')
+spawn(function() Service.show() end)
+advance(0.05)
+check(processChecks == checks + 1, 'Show Scopes checks the helper process, got ' .. (processChecks - checks))
 check(not Service.worker.link.connected, 'missing helper process drops the link')
 check(#sockets == socketCount + 1, 'a fresh socket is bound for the next helper')
 check(oldSock.reconnects == oldReconnects and not oldSock.closed, 'the old socket is not touched')
 oldSock.params.onClosed(oldSock) -- a late callback from the abandoned socket
 advance(0.3)
 check(#sockets == socketCount + 1, 'callbacks from an abandoned socket are ignored')
+advance(0.3)
+check(#executed == 2, 'Show Scopes relaunches the helper')
 n = #target.requests
 target.editCount = target.editCount + 1
 advance(3)
 check(#target.requests == n, 'no requests while the helper is disconnected')
-check(#executed == 1, 'a lost helper is not relaunched by itself')
-
-spawn(function() Service.show() end)
-advance(0.3)
-check(#executed == 2, 'Show Scopes relaunches the helper')
 check(executed[2]:find('--port ' .. sock().port, 1, true), 'relaunched helper gets the new port: ' .. executed[2])
 advance(20)
 check(#executed == 3, 'one bounded retry when the helper never connects, got ' .. #executed)
@@ -424,7 +439,6 @@ check(#executed == 3, 'show does not relaunch a connected helper')
 -- Helper dies (crash, force quit) and Show Scopes comes before the periodic check
 ---------------------------------------------------------------------------------
 
-check(processChecks - checks < 10, 'process checks are not excessive')
 advance(0.1)
 socketCount = #sockets
 helper.quit()
@@ -463,6 +477,144 @@ target.editCount = target.editCount + 1
 advance(0.5)
 lastRequest().cb(nil, 'error loading thumb')
 check(#sentOfType('previewError') == errors, 'no previewError once a frame was shown')
+
+-- Large raws: after an edit Lightroom may have no preview for many seconds. Keep
+-- retrying past the settle delays, then deliver the frame when it is back.
+local function failPending()
+    -- Fail every request issued since the last call (each fails exactly once).
+    for _, r in ipairs(target.requests) do
+        if not r.answered then r.answered = true; r.cb(nil, 'error loading thumb') end
+    end
+end
+for _, r in ipairs(target.requests) do r.answered = true end
+local framesBeforeStreak = countFrames()
+local requestsBeforeStreak = #target.requests
+target.editCount = target.editCount + 1
+for _ = 1, 60 do advance(0.25); failPending() end -- 15 s of failures
+local issued = #target.requests
+check(issued - requestsBeforeStreak <= 14, 'backoff keeps retries modest, got ' .. (issued - requestsBeforeStreak))
+advance(2.5)
+check(#target.requests > issued, 'still retrying 15 s after the edit, beyond the settle delays')
+
+-- Lightroom may report a failure more than once per request; that must not multiply
+-- the retries.
+local before = #target.requests
+for _ = 1, 20 do
+    advance(0.25)
+    for _, q in ipairs(target.requests) do
+        if not q.answered then q.answered = true; q.cb(nil, 'error loading thumb'); q.cb(nil, 'error loading thumb') end
+    end
+end
+check(#target.requests - before <= 4, 'double failure callbacks do not multiply retries, got ' .. (#target.requests - before))
+local r = lastRequest()
+r.answered = true
+r.cb('JPEG-C2')
+check(countFrames() == framesBeforeStreak + 1, 'frame sent once Lightroom has a preview again')
+advance(10)
+check(#target.requests <= issued + 6, 'retries stop after a success')
+
+-- A streak that never ends stops after the retry window, until the next edit.
+for _, q in ipairs(target.requests) do q.answered = true end
+target.editCount = target.editCount + 1
+for _ = 1, 160 do advance(0.25); failPending() end -- 40 s
+issued = #target.requests
+advance(10); failPending()
+check(#target.requests == issued, 'retries give up after the retry window')
+target.editCount = target.editCount + 1
+advance(1); failPending()
+check(#target.requests > issued, 'the next edit starts requesting again')
+for _ = 1, 8 do advance(0.25); failPending() end
+lastRequest().cb('JPEG-C3')
+for _, q in ipairs(target.requests) do q.answered = true end
+
+---------------------------------------------------------------------------------
+-- Smaller fallback sizes when Lightroom has no preview at the chosen size
+---------------------------------------------------------------------------------
+
+-- Model: after an edit only small thumbnails of the photo being developed are current.
+local function answer(maxOk, jpeg)
+    for _, q in ipairs(target.requests) do
+        if not q.answered then
+            q.answered = true
+            if q.w <= maxOk then q.cb(jpeg) else q.cb(nil, 'error loading thumb') end
+        end
+    end
+end
+target = newPhoto(4, 'D.dng')
+advance(0.3)
+check(lastRequest().w == 1024, 'a new photo starts at the preferred size')
+answer(1024, 'JPEG-D1')
+for _ = 1, 4 do advance(0.3); answer(1024, 'JPEG-D1') end
+local framesD = countFrames()
+target.editCount = target.editCount + 1
+for _ = 1, 10 do advance(0.3); answer(640, 'JPEG-D2') end
+check(countFrames() == framesD + 1, 'edit shown via the 640 px fallback')
+check(lastRequest().w == 640, 'the photo stays at the size that works')
+target.editCount = target.editCount + 1
+for _ = 1, 10 do advance(0.3); answer(320, 'JPEG-D3') end
+check(countFrames() == framesD + 2, 'steps down to 320 px when 640 fails too')
+target = newPhoto(5, 'E.dng')
+advance(0.3)
+check(lastRequest().w == 1024, 'the next photo starts at the preferred size again')
+answer(1024, 'JPEG-E1')
+for _, q in ipairs(target.requests) do q.answered = true end
+
+---------------------------------------------------------------------------------
+-- Slow renders throttle further requests (Lightroom must stay responsive)
+---------------------------------------------------------------------------------
+
+do
+    for _ = 1, 30 do advance(0.3); answer(1024, 'JPEG-E1') end
+    local first = #target.requests
+    local completedAt
+    -- Drag a slider continuously; each render takes 0.5 s.
+    for i = 1, 40 do
+        target.editCount = target.editCount + 1
+        observers[1].fn(observers[1].obs)
+        advance(0.05)
+        local q = lastRequest()
+        if not q.answered and clock - (q.at or clock) >= 0.5 then
+            q.answered = true; q.cb('JPEG-E-' .. i); completedAt = completedAt or clock
+        end
+        q.at = q.at or clock
+    end
+    local issued = #target.requests - first
+    -- 2 s of dragging with 0.5 s renders + 2x idle = one request per 1.5 s.
+    check(issued <= 3, 'slow renders throttle requests while dragging, got ' .. issued)
+    for _ = 1, 30 do advance(0.3); answer(1024, 'JPEG-E9') end
+end
+
+---------------------------------------------------------------------------------
+-- "updating" tells the helper when the scopes lag behind the latest edit
+---------------------------------------------------------------------------------
+
+do
+    local function updatingNow()
+        advance(0.06) -- state goes out on the next tick
+        return lastOfType('state'):find('"updating":true', 1, true) ~= nil
+    end
+    quiesce('JPEG-U0')
+    check(not updatingNow(), 'not updating when the frame is current')
+    target.editCount = target.editCount + 1
+    observers[1].fn(observers[1].obs)
+    check(updatingNow(), 'updating right after an edit')
+    local stale = lastRequest()
+    advance(0.2)
+    target.editCount = target.editCount + 1
+    observers[1].fn(observers[1].obs) -- another edit while the first request renders
+    stale.done = true
+    stale.cb('JPEG-U1')
+    check(updatingNow(), 'a frame from before the latest edit keeps it updating')
+    quiesce('JPEG-U2')
+    check(not updatingNow(), 'cleared once a frame reflects the latest edit')
+    target.editCount = target.editCount + 1
+    for _ = 1, 160 do
+        advance(0.25)
+        for _, q in ipairs(target.requests) do if not q.done then q.done = true; q.cb(nil, 'error loading thumb') end end
+    end
+    check(not updatingNow(), 'cleared when the plug-in gives up waiting')
+    quiesce('JPEG-U3')
+end
 
 ---------------------------------------------------------------------------------
 -- Launch failure is reported to the caller

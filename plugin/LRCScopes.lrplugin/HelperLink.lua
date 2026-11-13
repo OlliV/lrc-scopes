@@ -11,8 +11,10 @@ LrSocket behaviour this is built around (LrC 15.6, observed):
   * Normally the helper never goes away while Lightroom runs: its panel has no close
     button, only Show / Hide Scopes. Losing the link is for crashes and force quits.
   * A send-mode socket does not reliably report its client leaving (the connection
-    sits in CLOSE_WAIT with no onClosed), so while connected the link checks every
-    PROCESS_CHECK_INTERVAL that the helper process exists.
+    sits in CLOSE_WAIT with no onClosed), so Show Scopes checks that the helper process
+    exists before deciding not to relaunch it (verify()). This is deliberately not
+    done periodically: running a shell command every few seconds coincided with
+    requestJpegThumbnail failing ("error loading thumb") after nearly every edit.
   * A listening socket that nobody connects to reports onError "timeout" and is
     re-armed with reconnect(), the pattern the SDK documents; it never had a client.
   * Socket callbacks only record what happened; the service task calls tick() to act
@@ -27,7 +29,6 @@ local LrTasks = import 'LrTasks'
 local Log = require 'Log'
 
 local HelperLink = {
-    PROCESS_CHECK_INTERVAL = 2,
     -- The helper's executable name (CFBundleExecutable); pgrep -x matches it exactly.
     PROCESS_CHECK_COMMAND = '/usr/bin/pgrep -xq LRCScopes',
 }
@@ -47,7 +48,6 @@ function HelperLink.open(context, handlers)
         rearmTimeout = false,     -- listen timeout: re-arm (never had a client)
         rebind = false,           -- link lost: abandon the socket, bind a new one
         dropReason = nil,
-        lastProcessCheck = nil,
         closed = false,
     }, HelperLink)
     link:bind()
@@ -77,7 +77,6 @@ function HelperLink:bind()
             if not current() then return end
             link.up = true
             link.hadClient = true
-            link.lastProcessCheck = LrDate.currentTime() -- it just connected; it exists
         end,
         onClosed = function()
             if current() then link:lost('socket closed') end
@@ -110,7 +109,6 @@ end
 --- and drops the link if it is gone. Returns whether the link is still up.
 function HelperLink:verify()
     if not self.up then return false end
-    self.lastProcessCheck = LrDate.currentTime()
     if HelperLink.helperProcessExists() then return true end
     self:lost('helper process gone')
     self:tick()
@@ -118,13 +116,6 @@ function HelperLink:verify()
 end
 
 function HelperLink:tick()
-    local now = LrDate.currentTime()
-    if self.up and self.connected and not self.closed
-        and now - (self.lastProcessCheck or 0) >= HelperLink.PROCESS_CHECK_INTERVAL then
-        self.lastProcessCheck = now
-        if not HelperLink.helperProcessExists() then self:lost('helper process gone') end
-    end
-
     if self.connected and not self.up then
         self.connected = false
         Log.info('Helper disconnected (%s)', tostring(self.dropReason))

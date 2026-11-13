@@ -109,6 +109,22 @@ final class PanelTests: XCTestCase {
         XCTAssertTrue(try XCTUnwrap(c.window).styleMask.contains(.closable))
     }
 
+    func testUpdatingSpinnerDoesNotMoveTheToolbar() throws {
+        let window = try XCTUnwrap(controller.window)
+        controller.show(true)
+        window.layoutIfNeeded()
+        XCTAssertTrue(controller.updatingIndicator.superview != nil, "spinner is in the toolbar")
+        let statusFrame = controller.statusLabel.frame
+        let windowFrame = window.frame
+        controller.setUpdating(true)
+        window.layoutIfNeeded()
+        XCTAssertTrue(controller.isShowingUpdating)
+        XCTAssertEqual(controller.statusLabel.frame, statusFrame, "showing the spinner doesn't shift controls")
+        XCTAssertEqual(window.frame, windowFrame)
+        controller.setUpdating(false)
+        XCTAssertFalse(controller.isShowingUpdating)
+    }
+
     func testFrameMath() {
         let bounds = NSRect(x: 0, y: 0, width: 1000, height: 330)
         let f = ScopesContentView.frames(in: bounds, toolbarHeight: 30, layout: .both)

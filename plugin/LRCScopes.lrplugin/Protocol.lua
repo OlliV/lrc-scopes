@@ -4,7 +4,7 @@ One JSON object per line, terminated by "\n". Must match
 helper/Sources/ScopesCore/WireProtocol.swift:
 
   {"pluginVersion":"1.1.0","protocol":2,"type":"hello"}
-  {"enabled":true,"module":"develop","photo":{"id":1,"name":"A.CR3"},"type":"state"}
+  {"enabled":true,"module":"develop","photo":{"id":1,"name":"A.CR3"},"type":"state","updating":true}
   {"type":"frame","seq":7,"photoId":1,"renderMs":85,"sentAt":784249200.250,"jpeg":"<base64>"}
   {"photoId":1,"reason":"error loading thumb","type":"previewError"}
   {"type":"quit"}
@@ -81,12 +81,14 @@ function Protocol.hello(pluginVersion)
     return encode({ type = 'hello', ['protocol'] = Protocol.VERSION, pluginVersion = pluginVersion })
 end
 
-function Protocol.state(enabled, module, photoId, photoName)
+--- updating: an edit (or photo change) is not reflected in the last frame yet.
+function Protocol.state(enabled, module, photoId, photoName, updating)
     return encode({
         type = 'state',
         enabled = enabled,
         module = module,
         photo = photoId and { id = photoId, name = photoName } or nil,
+        updating = updating or nil,
     })
 end
 

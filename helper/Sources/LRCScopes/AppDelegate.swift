@@ -183,8 +183,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Presentation
 
+    /// True while the scopes don't show the latest edit yet: the plug-in says it is
+    /// waiting for Lightroom, or the selected photo's first frame hasn't arrived.
+    private var isAwaitingUpdate: Bool {
+        guard protocolMismatch == nil, isPluginResponsive, let state = latestState,
+              let photo = state.photo else { return false }
+        if let error = previewError, error.photoId == photo.id { return false }
+        return state.updating == true || currentPhotoId != photo.id
+    }
+
     private func updateStatusAndMessage() {
         guard options.port != nil else { return }
+        panel.setUpdating(isAwaitingUpdate)
         if let v = protocolMismatch {
             panel.setStatus("")
             panel.setMessage("The scopes app and the Lightroom plug-in don't match (protocol \(v) vs \(WireProtocol.version)).\nReinstall the LRC Scopes plug-in.")

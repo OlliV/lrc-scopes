@@ -203,6 +203,14 @@ final class WireProtocolTests: XCTestCase {
         guard case .state(let s) = try PluginMessage.decode(line: Data(#"{"enabled":false,"module":"library","type":"state"}"#.utf8)) else { return XCTFail() }
         XCTAssertNil(s.photo)
         XCTAssertFalse(s.isInDevelop)
+        XCTAssertNil(s.updating)
+    }
+
+    func testStateUpdatingFlag() throws {
+        // Exactly what Protocol.lua sends (sorted keys).
+        let line = #"{"enabled":true,"module":"develop","photo":{"id":1,"name":"A.CR3"},"type":"state","updating":true}"#
+        guard case .state(let s) = try PluginMessage.decode(line: Data(line.utf8)) else { return XCTFail() }
+        XCTAssertEqual(s.updating, true)
     }
 
     func testDecodesFrameWithBase64Payload() throws {

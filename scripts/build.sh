@@ -8,7 +8,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 VERSION="1.1.0"
-BUILD_NUMBER="${BUILD_NUMBER:-7}"
+BUILD_NUMBER="${BUILD_NUMBER:-13}"
 SIGN_IDENTITY="${SIGN_IDENTITY:--}"
 
 OUT="$ROOT/build"

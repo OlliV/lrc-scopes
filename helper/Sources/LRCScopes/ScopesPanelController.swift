@@ -123,6 +123,9 @@ final class ScopesPanelController: NSWindowController, NSWindowDelegate {
     let navigatorView = NavigatorView(frame: .zero)
     private(set) var contentView: ScopesContentView!
     let statusLabel = NSTextField(labelWithString: "")
+    /// Spins while the plug-in waits for Lightroom to render the latest edit. Always in
+    /// the toolbar (hidden when stopped) so showing it never shifts the other controls.
+    let updatingIndicator = NSProgressIndicator()
 
     let layoutControl = NSSegmentedControl()
     let modeControl = NSSegmentedControl()
@@ -202,6 +205,14 @@ final class ScopesPanelController: NSWindowController, NSWindowDelegate {
 
     func setStatus(_ text: String) {
         statusLabel.stringValue = text
+    }
+
+    private(set) var isShowingUpdating = false
+
+    func setUpdating(_ updating: Bool) {
+        guard updating != isShowingUpdating else { return }
+        isShowingUpdating = updating
+        if updating { updatingIndicator.startAnimation(nil) } else { updatingIndicator.stopAnimation(nil) }
     }
 
     // MARK: - Frame persistence
@@ -301,13 +312,20 @@ final class ScopesPanelController: NSWindowController, NSWindowDelegate {
         statusLabel.lineBreakMode = .byTruncatingMiddle
         statusLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
 
+        updatingIndicator.style = .spinning
+        updatingIndicator.controlSize = .small
+        updatingIndicator.isIndeterminate = true
+        updatingIndicator.isDisplayedWhenStopped = false
+        updatingIndicator.toolTip = "Waiting for Lightroom to render the latest change"
+
         let toolbar = NSStackView(views: [layoutControl, regionButton, modeControl, zoomControl, colorizeCheckbox, skinCheckbox,
-                                          intensityLabel, gainSlider, statusLabel])
+                                          intensityLabel, gainSlider, updatingIndicator, statusLabel])
         toolbar.orientation = .horizontal
         toolbar.alignment = .centerY
         toolbar.spacing = 10
         toolbar.edgeInsets = NSEdgeInsets(top: 4, left: 10, bottom: 4, right: 10)
         toolbar.setCustomSpacing(4, after: intensityLabel)
+        toolbar.setCustomSpacing(6, after: updatingIndicator)
         // In a narrow window, drop the least important items instead of overflowing.
         toolbar.setClippingResistancePriority(.defaultLow, for: .horizontal)
         toolbar.setVisibilityPriority(NSStackView.VisibilityPriority(rawValue: 100), for: statusLabel)
